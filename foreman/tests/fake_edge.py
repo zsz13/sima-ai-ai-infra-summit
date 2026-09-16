@@ -57,6 +57,7 @@ app = FastAPI(title="fake-edge (TEST HARNESS)")
 
 STATE = {
     "present": False,      # is an item in frame?
+    "label": "box",        # what the detector reports seeing
     "bbox": [0.30, 0.30, 0.60, 0.60],
     "verdict": "pass",
     "reason": "Synthetic verdict from the test harness. Not a real inference.",
@@ -85,7 +86,7 @@ async def events() -> StreamingResponse:
             dets = []
             if STATE["present"]:
                 dets = [{
-                    "label": "box",
+                    "label": STATE["label"],
                     "confidence": 0.93,
                     "bbox": list(STATE["bbox"]),
                     "track_id": 1,
@@ -113,7 +114,7 @@ async def inspect(body: dict) -> dict:
         "ts": start + (i + 0.5) * window_s / max(want, 1),
         "rel_ts": round((i + 0.5) * window_s / max(want, 1), 3),
         "sharpness": 120.0 - i,
-        "detections": ([{"label": "box", "confidence": 0.93,
+        "detections": ([{"label": STATE["label"], "confidence": 0.93,
                          "bbox": list(STATE["bbox"]), "track_id": 1}]
                        if STATE["present"] else []),
         "jpeg_b64": TINY_JPEG_B64,
@@ -149,14 +150,35 @@ async def inspect_single(body: dict) -> dict:
     }
 
 
+#: What the harness "hears" for each speech language, so the bilingual path can
+#: be exercised without a microphone or a DevKit.
+FAKE_SPEECH = {
+    "en": "every box must have a label facing up and the lid closed",
+    "ru": "человек должен держать телефон",
+}
+
+
 @app.post("/transcribe")
-async def transcribe(file: UploadFile) -> dict:
+async def transcribe(file: UploadFile, language: str = "auto") -> dict:
     await file.read()
+    if STATE.get("speech_unclear"):
+        return {
+            "text": "", "language": "en", "mode": language, "accepted": False,
+            "reject_reason": "the recording does not appear to contain speech",
+            "avg_logprob": -0.53, "no_speech_prob": 0.91,
+            "metrics": {"inference_ms": 240.0, "asr_calls": 1},
+        }
+    decoded = "ru" if language == "ru" else "en"
+    calls = 2 if language == "auto" else 1
     return {
-        "text": "every box must have a label facing up and the lid closed",
-        "language": "en",
+        "text": FAKE_SPEECH[decoded],
+        "language": decoded,
+        "mode": language,
+        "accepted": True,
+        "reject_reason": "",
+        "avg_logprob": -0.06,
         "no_speech_prob": 0.01,
-        "metrics": {"inference_ms": 380.0},
+        "metrics": {"inference_ms": 380.0 * calls, "asr_calls": float(calls)},
     }
 
 

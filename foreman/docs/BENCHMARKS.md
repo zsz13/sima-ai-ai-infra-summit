@@ -129,6 +129,55 @@ than real time.** Transcript: `" Why is the sky blue?"`, `language=en`,
 Through the full path (browser -> Mac host -> DevKit): **256 ms** model inference,
 289 ms total round trip.
 
+### 4.1 Language constraint (English / Russian only)
+
+Whisper-small is multilingual and its compiled `language_detect` stage picks from
+~99 languages. On real microphone audio it chose **Bulgarian** for the English
+sentence "This person must be holding a phone", producing
+`"Това пързина не ме ме ме обгърваме."` The detection stage is the failure, so
+Foreman never uses it: every decode pins an explicit ISO code.
+
+The server honours `language=en` / `language=ru` and skips detection entirely.
+Measured with `say`-generated speech (Samantha / Daniel / Alex for English,
+Milena for Russian), 2 s clips, `avg_logprob` of the forced decode:
+
+| Clip | spoken | forced `en` | forced `ru` | argmax |
+|---|---|---|---|---|
+| e1 | English | **-0.061** | -1.230 | en |
+| e2 | English | **-0.075** | -1.299 | en |
+| e3 | English | **-0.106** | -0.238 | en |
+| r1 | Russian | -0.512 | **-0.056** | ru |
+| r2 | Russian | -0.570 | **-0.050** | ru |
+| r3 | Russian | -0.572 | **-0.049** | ru |
+
+**Auto EN/RU decodes the clip both ways and keeps the more likely reading**, so a
+third language cannot be returned whatever the audio sounds like. 6/6 correct
+here, 12/12 through the edge API. Cost is one extra decode: **~245 ms forced,
+~490 ms auto**, both well inside the gate.
+
+A forced decode does not always honour the language - asked for Russian on e3,
+Whisper returned the English sentence verbatim at a healthy -0.238. A decode
+whose alphabet contradicts the language it was forced into is therefore discarded
+before likelihood is compared.
+
+### 4.2 Rejecting speech that is not usable
+
+`no_speech_prob` is the discriminator, not `avg_logprob`:
+
+| Input | `no_speech_prob` | `avg_logprob` | text returned |
+|---|---|---|---|
+| real speech (6 clips) | 0.002 - 0.005 | -0.05 to -0.11 | correct |
+| 2 s digital silence | 0.944 | -0.281 | `Редактор субтитров Н.Закомолдина...` |
+| 2 s pink noise | 0.905 | -0.529 | `СПОКОЙНАЯ МУЗЫКА` |
+| speech buried in noise | 0.832 | -0.489 | `СПОКОЙНАЯ МУЗЫКА` |
+
+Whisper hallucinates *confidently* on silence - those are well-known artefacts and
+they score a perfectly healthy likelihood, so a likelihood threshold alone would
+accept them. The gap in `no_speech_prob` is three orders of magnitude, which is why
+the threshold sits at 0.60 and is not finely tuned. A rejected transcript leaves
+the standard in force untouched and the console says "Speech unclear - please
+repeat."
+
 ## 5. End-to-end
 
 Item settles in frame -> verdict rendered in the console, measured on the Mac.

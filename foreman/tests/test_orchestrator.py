@@ -376,3 +376,168 @@ async def test_audit_record_keeps_the_original_fields(edge_url, tmp_path):
     finally:
         await orch.stop()
         await orch.edge.aclose()
+
+
+# --- Camera Check ------------------------------------------------------
+#
+# Camera Check is a detector-only debugging view. It must observe without
+# consuming: pausing is not the same as inspecting.
+
+async def test_camera_check_does_not_consume_the_item(edge_url, tmp_path):
+    """Leaving Camera Check must not leave the console idle.
+
+    The gate fires once per item and then latches until that item leaves frame.
+    If it were allowed to advance while paused, the item in view would already be
+    marked inspected on the way out, and the operator would see nothing happen
+    for no visible reason.
+    """
+    orch = await _orch(edge_url, tmp_path)
+    orch.set_standard("every box must have a label facing up")
+    orch.paused = True
+    await orch.start()
+    try:
+        assert await _wait_for(lambda: orch.connected), "never connected"
+        STATE["present"] = True
+        await asyncio.sleep(1.0)
+        assert orch.counters.total == 0, "Camera Check must not inspect"
+
+        orch.paused = False
+        assert await _wait_for(lambda: orch.counters.total >= 1), \
+            "the item in view was consumed while paused and never inspected"
+    finally:
+        STATE["present"] = False
+        await orch.stop()
+        await orch.edge.aclose()
+
+
+async def test_camera_check_writes_no_verdict_records(edge_url, tmp_path):
+    orch = await _orch(edge_url, tmp_path)
+    orch.set_standard("every box must have a label facing up")
+    orch.paused = True
+    await orch.start()
+    try:
+        assert await _wait_for(lambda: orch.connected), "never connected"
+        STATE["present"] = True
+        await asyncio.sleep(1.2)
+        assert orch.counters.total == 0
+        assert orch.recent == [] or len(orch.recent) == 0
+        assert not (tmp_path / "inspections.jsonl").exists()
+    finally:
+        STATE["present"] = False
+        await orch.stop()
+        await orch.edge.aclose()
+
+
+async def test_camera_check_keeps_the_standard(edge_url, tmp_path):
+    orch = await _orch(edge_url, tmp_path)
+    orch.set_standard("Человек должен держать телефон.")
+    await orch.start()
+    try:
+        orch.paused = True
+        await asyncio.sleep(0.3)
+        assert orch.standard == "Человек должен держать телефон."
+        orch.paused = False
+        assert orch.standard == "Человек должен держать телефон."
+        assert orch.parsed_standard()["required"] == ["person", "cell phone"]
+    finally:
+        await orch.stop()
+        await orch.edge.aclose()
+
+
+# --- bilingual speech --------------------------------------------------
+
+async def test_transcribe_honours_a_forced_language(edge_url):
+    client = EdgeClient(edge_url)
+    try:
+        ru = await client.transcribe(b"RIFF....fake wav", language="ru")
+        assert ru.language == "ru"
+        assert ru.accepted
+        assert ru.metrics["asr_calls"] == 1.0
+        en = await client.transcribe(b"RIFF....fake wav", language="en")
+        assert en.language == "en"
+    finally:
+        await client.aclose()
+
+
+async def test_auto_mode_decodes_twice(edge_url):
+    """Auto EN/RU decodes the clip both ways rather than asking Whisper to guess."""
+    client = EdgeClient(edge_url)
+    try:
+        t = await client.transcribe(b"RIFF....fake wav", language="auto")
+        assert t.mode == "auto"
+        assert t.language in ("en", "ru")
+        assert t.metrics["asr_calls"] == 2.0
+    finally:
+        await client.aclose()
+
+
+async def test_unclear_speech_does_not_replace_the_standard(edge_url, tmp_path):
+    orch = await _orch(edge_url, tmp_path)
+    orch.set_standard("the lid must be closed")
+    STATE["speech_unclear"] = True
+    try:
+        t = await orch.edge.transcribe(b"RIFF....silence", language="auto")
+        assert not t.accepted
+        assert t.reject_reason
+        # the caller must not adopt it
+        if t.accepted:
+            orch.set_standard(t.text)
+        assert orch.standard == "the lid must be closed"
+    finally:
+        STATE["speech_unclear"] = False
+        await orch.edge.aclose()
+
+
+async def test_russian_standard_is_detector_grounded(edge_url, tmp_path):
+    """A Russian rule must ground exactly like its English twin.
+
+    If it parsed to nothing, host/policy.py would have no detector evidence to
+    weigh and would defer entirely to the vision-language model - removing the
+    protection temporal grounding exists to provide.
+    """
+    orch = await _orch(edge_url, tmp_path)
+    orch.set_standard("Человек должен держать телефон.", language="ru")
+    parsed = orch.parsed_standard()
+    assert parsed["language"] == "ru"
+    assert parsed["grounded"] is True
+    assert parsed["required"] == ["person", "cell phone"]
+    await orch.edge.aclose()
+
+
+@pytest.mark.parametrize(("standard", "language"), [
+    ("The person must be holding a phone.", "en"),
+    ("Человек должен держать телефон.", "ru"),
+])
+async def test_a_missing_object_fails_in_either_language(edge_url, tmp_path,
+                                                         standard, language):
+    """Drive a whole inspection, not just the parse.
+
+    The detector sees a person and never a phone, and the harness's model is
+    rigged to say PASS. The verdict must still be FAIL, decided by the detector,
+    in both languages - which is only possible if the Russian standard reached
+    `build_evidence` with the same COCO classes as the English one.
+    """
+    orch = await _orch(edge_url, tmp_path)
+    orch.set_standard(standard, language=language)
+    STATE["label"] = "person"
+    STATE["verdict"] = "pass"
+    STATE["reason"] = "The person is holding a smartphone."
+    STATE["detector_summary"] = "- person: detected in 45/45 frames (100%)."
+    await orch.start()
+    try:
+        assert await _wait_for(lambda: orch.connected), "never connected"
+        STATE["present"] = True
+        assert await _wait_for(lambda: orch.counters.total >= 1), "no inspection recorded"
+        rec = orch.recent[-1]
+        assert rec.verdict == "fail", "the model must not conjure a phone the detector never saw"
+        assert rec.decided_by == "detector-absent"
+        labels = {o["label"] for o in rec.required_objects}
+        assert labels == {"person", "cell phone"}
+        absent = next(o for o in rec.required_objects if o["label"] == "cell phone")
+        assert absent["frames_present"] == 0
+    finally:
+        STATE.update(present=False, label="box", verdict="pass",
+                     reason="Synthetic verdict from the test harness. Not a real inference.",
+                     detector_summary="- box: detected in 45/45 frames (100%).")
+        await orch.stop()
+        await orch.edge.aclose()

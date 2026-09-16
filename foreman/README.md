@@ -131,7 +131,7 @@ Changing the standard is a sentence, not a sprint.
 | **Session state and pass/fail policy** | Business logic. No accelerator benefit. |
 | **Audit trail + evidence storage** | Durable storage belongs on the machine with the disk. |
 | **Camera capture and RTSP publish** | The camera is attached to the Mac. |
-| **Product UI** | Presentation. |
+| **Product UI** | Presentation. Three static files, no build step. |
 
 The split is deliberate, not decorative: the Mac never does inference, and the
 DevKit never does bookkeeping.
@@ -303,14 +303,28 @@ presented as measurements of this application.
   label or a seal has no detector support, so those verdicts rest on the model
   alone — and the console says so rather than implying grounding it does not have.
 - **The parser is deterministic, not a language model.** It handles "must not",
-  "no X", plurals and clause splitting, but it is not a semantic parser. An
-  unparsed object is reported as ungrounded rather than silently guessed.
+  "no X", plurals, Russian noun cases and clause splitting, but it is not a
+  semantic parser. An unparsed object is left ungrounded rather than silently
+  guessed. Three phrasings are known to read the polarity backwards in *both*
+  languages — an object stated before the negation ("the phone must not be on the
+  table"), a coordinated prohibition ("no phone and bottle"), and a Russian
+  sentence dominated by Latin brand names. They are listed at the top of
+  `host/standard_parser.py`; the console always shows the parsed reading so a
+  misread rule is visible before it is acted on.
+- **Spoken standards are English or Russian only.** Whisper-small's language
+  detection picks from ~99 languages and got it badly wrong on real microphone
+  audio - it returned Bulgarian for an English sentence. Foreman therefore pins
+  the decoding language instead of detecting it, and "Auto" chooses between
+  exactly those two by decoding both ways. Speaking a third language will produce
+  a forced English or Russian transcript, which the operator can see and retype.
 - **The detector and the VLM share one MLA.** Measured, the detector holds 15 fps
   with judgements running - but it is camera-bound at 15 fps and has ~10x headroom,
   so that result does not prove there is no contention at saturation.
 - **Whisper cannot be fine-tuned here.** `whisper-small-a16w8` is consume-as-is —
   it is not `llima-compile`-able — so domain jargon may transcribe poorly. The
-  console always shows the transcribed standard so it can be corrected by typing.
+  console always shows the transcribed standard so it can be corrected by typing,
+  and a recording it cannot read is rejected rather than allowed to replace the
+  standard in force.
 - **No re-inspection queue.** An `unclear` verdict is recorded, not retried.
 - **The demo camera is the Mac's**, published over RTSP. A production
   installation would use a MIPI or USB camera on the board.

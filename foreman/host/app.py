@@ -120,28 +120,46 @@ async def set_standard(body: dict) -> dict:
     if not isinstance(text, str) or not text.strip():
         raise HTTPException(400, "text must be a non-empty string")
     orchestrator.set_standard(text)
-    return {"standard": orchestrator.standard}
+    return {"standard": orchestrator.standard, "parsed": orchestrator.parsed_standard()}
 
 
 @app.post("/api/standard/speak")
-async def set_standard_from_speech(file: UploadFile) -> dict:
-    """Upload spoken audio -> Whisper on the Modalix MLA -> new standard."""
+async def set_standard_from_speech(file: UploadFile, language: str = "auto") -> dict:
+    """Upload spoken audio -> Whisper on the Modalix MLA -> new standard.
+
+    `language` is "en", "ru" or "auto" (English or Russian only). A transcript
+    the edge rejected as unclear is returned with accepted=false and the standard
+    in force is left untouched, so a garbled rule can never silently take over an
+    inspection.
+    """
     audio = await file.read()
     if not audio:
         raise HTTPException(400, "empty audio upload")
+    if language not in ("en", "ru", "auto"):
+        raise HTTPException(400, "language must be en, ru or auto")
     try:
-        transcript = await orchestrator.edge.transcribe(audio, file.filename or "speech.wav")
+        transcript = await orchestrator.edge.transcribe(
+            audio, file.filename or "speech.wav", language)
     except EdgeError as exc:
         raise HTTPException(503, f"ASR unavailable: {exc}") from exc
-    if not transcript.text:
-        raise HTTPException(422, "no speech detected")
-    orchestrator.set_standard(transcript.text)
-    return {
-        "standard": orchestrator.standard,
+
+    result = {
+        "accepted": transcript.accepted,
+        "transcript": transcript.text,
         "language": transcript.language,
+        "mode": transcript.mode,
+        "avg_logprob": transcript.avg_logprob,
         "no_speech_prob": transcript.no_speech_prob,
         "metrics": transcript.metrics,
+        "standard": orchestrator.standard,
     }
+    if not transcript.accepted:
+        result["reason"] = transcript.reject_reason or "the speech was not clear enough"
+        return result
+    orchestrator.set_standard(transcript.text, language=transcript.language)
+    result["standard"] = orchestrator.standard
+    result["parsed"] = orchestrator.parsed_standard()
+    return result
 
 
 @app.get("/api/live")

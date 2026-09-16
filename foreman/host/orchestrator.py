@@ -24,7 +24,7 @@ from pathlib import Path
 from .edge_client import EdgeClient, EdgeError, Frame, Verdict
 from .gate import Gate, GateConfig
 from .policy import GroundingConfig, VlmJudgement, build_evidence, decide
-from .standard_parser import parse_standard
+from .standard_parser import parse_standard, resolve_language
 
 MAX_RECENT = 40
 RECONNECT_BACKOFF = (1.0, 2.0, 4.0, 8.0, 15.0)
@@ -81,6 +81,8 @@ class Orchestrator:
     gate_config: GateConfig = field(default_factory=GateConfig)
 
     standard: str = ""
+    #: "en" or "ru" - which lexicon parses the standard above
+    standard_language: str = "en"
     connected: bool = False
     last_error: str | None = None
     frames_seen: int = 0
@@ -155,6 +157,8 @@ class Orchestrator:
             "connected": self.connected,
             "last_error": self.last_error,
             "standard": self.standard,
+            "standard_language": self.standard_language,
+            "parsed_standard": self.parsed_standard(),
             "gate_state": self._gate.state.value,
             "gate_progress": round(self._gate.progress, 3),
             "inspecting": self.inspecting,
@@ -173,11 +177,28 @@ class Orchestrator:
 
     # --- control --------------------------------------------------------
 
-    def set_standard(self, text: str) -> None:
-        """Adopt a new inspection standard and re-arm the gate."""
+    def set_standard(self, text: str, language: str | None = None) -> None:
+        """Adopt a new inspection standard and re-arm the gate.
+
+        `language` is what the speech recogniser decoded ("en" or "ru"). It is a
+        hint, not an instruction: the lexicon is chosen from the script the text
+        is actually written in, so a mislabelled transcript cannot be parsed with
+        a lexicon that matches none of its words - which would ground nothing and
+        quietly hand the verdict to the vision-language model alone.
+        """
         self.standard = text.strip()
+        self.standard_language = resolve_language(self.standard, language)
         self._gate.reset()
         self._publish()
+
+    def parsed_standard(self) -> dict:
+        """The detector-groundable reading of the current standard, for the UI.
+
+        Showing this is how an operator can tell that a rule was understood -
+        and, just as importantly, when it was not and the verdict will therefore
+        rest on the vision-language model alone.
+        """
+        return parse_standard(self.standard, self.standard_language).public()
 
     def clear_session(self) -> None:
         self.counters = Counters()
@@ -272,9 +293,19 @@ class Orchestrator:
             span = self._fps_window[-1] - self._fps_window[0]
             self.fps = (len(self._fps_window) - 1) / span if span > 0 else 0.0
 
+        if self.paused:
+            # Camera Check must not consume items. Advancing the gate while
+            # paused latches the item in view as already inspected, so returning
+            # to the inspection view would sit idle until that item left the
+            # frame and came back - the console looks dead for no visible reason.
+            # Keep the gate armed instead; the evidence ring above still fills.
+            self._gate.reset()
+            self._publish()
+            return
+
         should_inspect = self._gate.update(frame.detections)
 
-        if should_inspect and self.standard and not self.inspecting and not self.paused:
+        if should_inspect and self.standard and not self.inspecting:
             if self.temporal and not self._window_ready():
                 # The gate settled before the evidence window had filled - which
                 # happens on the first item after connecting or after a new
@@ -323,7 +354,7 @@ class Orchestrator:
 
     async def _inspect_temporal(self, trigger, started: float) -> Inspection:
         """Detector evidence across the window decides what the VLM is allowed to say."""
-        parsed = parse_standard(self.standard)
+        parsed = parse_standard(self.standard, self.standard_language)
         evidence = await self.edge.inspect_window(
             self.standard, list(parsed.required), list(parsed.prohibited),
             self.window_s, self.evidence_frames)

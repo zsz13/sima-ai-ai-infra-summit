@@ -28,6 +28,29 @@ Grounding policy, top down: window too short -> UNCLEAR; required object
 presence <= 10% -> **FAIL** (model cannot override); prohibited >= 60% -> FAIL;
 required below 60% -> UNCLEAR; otherwise the model judges the relationship.
 
+### Speech input
+
+Spoken standards are accepted in **English and Russian only**. The console's
+header selector sends `language=en|ru|auto` with each recording;
+`auto` decodes the clip both ways on the MLA and keeps the more likely reading,
+so a third language can never come back. Nothing is loaded or restarted when the
+selection changes - it is a per-request decoding parameter, and it applies to the
+next recording. See docs/BENCHMARKS.md 4.1 and 4.2.
+
+Both languages resolve to the same internal representation
+(`host/standard_parser.py`), so a Russian rule is detector-grounded exactly like
+its English twin. This is a safety property, not a convenience: a standard that
+parses to no objects gives `policy.py` nothing to weigh and hands the verdict to
+the model alone.
+
+### Console
+
+`foreman/frontend/` is three static files - `index.html`, `styles.css`, `app.js` -
+served straight off disk by `host/app.py` with `no-store`. **No build step and no
+framework**, deliberately: there is nothing to compile or install before a demo,
+and one less thing that can fail in front of a judge. Two hash routes,
+`#/inspection` and `#/camera`, so header nav, browser Back and Escape all behave.
+
 ## Hardware and addresses
 
 | | |
@@ -148,6 +171,32 @@ benchmark returns 0.00 W. Never quote SiMa's "under 10 W" as ours.
 10. **`timeout` does not exist on macOS**; use `curl --max-time`.
 11. **`pkill -f foreman_edge.py` over SSH kills its own session** - the pattern
     matches the remote command line. Use `[f]oreman_edge.py`.
+12. **Whisper chose Bulgarian for English speech.** whisper-small's compiled
+    `language_detect` stage picks from ~99 languages and got it badly wrong on
+    real microphone audio. Foreman now never uses that stage: every decode pins
+    an explicit ISO code, and Auto EN/RU decodes both ways and keeps the more
+    likely reading. See docs/BENCHMARKS.md 4.1.
+13. **Camera Check consumed the item.** The gate advanced while paused, latching
+    whatever was in view as already inspected, so returning to the inspection
+    view sat idle until that item left frame and came back - the console looked
+    dead. The gate is now held armed while paused
+    (`host/orchestrator.py`, regression test
+    `test_camera_check_does_not_consume_the_item`).
+14. **Camera Check could trap you.** It was a hidden panel, not a route, and the
+    page was pinned to `height:100%` with no scroll, so on a short viewport the
+    controls were clipped and unreachable. It is now a hash route (`#/camera`)
+    with header nav, browser Back and Escape, and the page scrolls.
+15. **DevKit processes vanish "for no reason".** Two causes, both real:
+    (a) `scripts/demo.sh` installs `trap cleanup EXIT INT TERM`, and that cleanup
+    kills the edge and the GenAI server on the board - so anything that ends a
+    `demo.sh` run tears down the whole stack, which looks like a crash;
+    (b) both programs trap SIGHUP and shut down, so `nohup ... &` inside an `ssh`
+    heredoc is not enough on its own. When starting them by hand outside
+    `demo.sh`, use `setsid ... </dev/null` so they lead their own session, and
+    check with `ps -o sid=` that SID == PID.
+16. **The edge does not retry RTSP.** If the camera stream is absent when the
+    edge starts, gstreamer reports `resource_not_found` and the agent serves
+    healthy-but-frameless forever. Start the camera first, then the edge.
 
 ## Must NOT be repeated
 
@@ -157,7 +206,9 @@ benchmark returns 0.00 W. Never quote SiMa's "under 10 W" as ours.
 - Do not create a second SDK container.
 - Do not force-push or rewrite pushed history.
 - Do not switch to the 4B VLM.
-- Do not raise the global detector threshold to hide duplicate boxes.
+- Do not raise the global detector threshold to hide duplicate boxes or to
+  tidy up Camera Check; it shows what the detector actually reports.
+- Do not let Whisper auto-detect freely - it returns Bulgarian. Pin the code.
 
 ## Fallback modes
 
@@ -174,10 +225,12 @@ benchmark returns 0.00 W. Never quote SiMa's "under 10 W" as ours.
 1. Physical validation needing props: person holding a phone (PASS), phone on the
    desk not held (FAIL), bottle in view (PASS), bottle with/without a cap, and a
    short occlusion. Only no-prop cases are verified so far.
-2. **The standard parser is English-only.** A Russian standard
-   ("Человек должен держать телефон") parses to zero objects, so grounding is
-   silently skipped and the verdict falls back to the model alone. The console
-   does say so, but this disables the main safety mechanism.
+2. ~~The standard parser is English-only.~~ **Done.** `host/standard_parser.py`
+   now carries an English and a Russian lexicon behind one engine; both produce
+   the same `required`/`prohibited` sets. Verified on hardware: the Russian
+   standard "Человек должен держать телефон." returned FAIL via `detector-absent`
+   with person 46/47 and cell phone 0/47 - identical grounding to the English
+   phrasing. Other languages still parse to nothing and say so in the console.
 3. Detector throughput at saturation (a source faster than 15 fps) is unmeasured.
 4. Accuracy on a real inspection task with a held-out item set.
 
@@ -187,4 +240,9 @@ Ask the operator to hold a phone in view, then set the standard
 "the person must be holding a phone" and confirm PASS; then put the phone on the
 desk in view and confirm FAIL. Those two cases exercise detector grounding and
 the VLM relationship judgement respectively, and are the last unverified part of
-the temporal pipeline.
+the temporal pipeline. Worth doing in both languages now that Russian grounds:
+"Человек должен держать телефон."
+
+Speech itself is verified with generated audio (`say -v Samantha` / `-v Milena`,
+12/12 correct through the edge API) but **not yet with a live microphone**, which
+is the one part of the speech path a person has to exercise.

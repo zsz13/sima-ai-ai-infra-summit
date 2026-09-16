@@ -88,7 +88,15 @@ class Verdict:
 @dataclass(frozen=True)
 class Transcript:
     text: str
+    #: the language actually decoded, always "en" or "ru"
     language: str
+    #: what was requested: "en", "ru" or "auto"
+    mode: str
+    #: False when the audio was too poor to build a standard from; the caller
+    #: must then leave the standard in force untouched
+    accepted: bool
+    reject_reason: str
+    avg_logprob: float
     no_speech_prob: float
     metrics: dict[str, float]
 
@@ -239,11 +247,18 @@ class EdgeClient:
             metrics={k: float(v) for k, v in (obj.get("metrics") or {}).items()},
         )
 
-    async def transcribe(self, audio: bytes, filename: str = "speech.wav") -> Transcript:
-        """Send audio to the DevKit's Whisper ASR (MLA)."""
+    async def transcribe(self, audio: bytes, filename: str = "speech.wav",
+                         language: str = "auto") -> Transcript:
+        """Send audio to the DevKit's Whisper ASR (MLA).
+
+        `language` is "en", "ru" or "auto"; auto chooses between those two only.
+        Nothing is loaded or restarted when it changes - it is a per-request
+        decoding parameter, so the switch takes effect on the next recording.
+        """
         try:
             r = await self._client.post(
                 "/transcribe",
+                params={"language": language},
                 files={"file": (filename, audio, "application/octet-stream")},
             )
             r.raise_for_status()
@@ -256,6 +271,10 @@ class EdgeClient:
         return Transcript(
             text=str(obj.get("text", "")).strip(),
             language=str(obj.get("language", "unknown")),
+            mode=str(obj.get("mode", language)),
+            accepted=bool(obj.get("accepted", True)),
+            reject_reason=str(obj.get("reject_reason", "")),
+            avg_logprob=float(obj.get("avg_logprob", 0.0)),
             no_speech_prob=float(obj.get("no_speech_prob", 0.0)),
             metrics={k: float(v) for k, v in (obj.get("metrics") or {}).items()},
         )

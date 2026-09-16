@@ -38,12 +38,14 @@ import contextlib
 import json
 import os
 import queue
+import re
 import signal
 import struct
 import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import deque
 from dataclasses import dataclass
@@ -149,6 +151,112 @@ def publish(event: dict) -> None:
         # A slow consumer must never stall the pipeline.
         with contextlib.suppress(queue.Full):
             q.put_nowait(payload)
+
+
+# ----------------------------------------------------- speech language control
+
+#: Foreman accepts spoken standards in these two languages only.
+#:
+#: whisper-small is multilingual and its compiled `language_detect` stage picks
+#: freely from ~99 languages. On real microphone audio that stage returned
+#: Bulgarian for the English sentence "This person must be holding a phone",
+#: yielding "Това пързина не ме ме ме обгърваме." Constraining the decode is the
+#: only reliable fix: the detector head itself is what fails.
+SPEECH_LANGUAGES = ("en", "ru")
+SPEECH_MODES = ("en", "ru", "auto")
+
+#: Measured on this board with whisper-small-a16w8 (see docs/BENCHMARKS.md).
+#: Real speech scores no_speech_prob 0.002-0.005; silence, pink noise and speech
+#: buried in noise all score 0.83-0.94. The gap is three orders of magnitude, so
+#: this threshold is not finely tuned - anything in 0.3-0.8 behaves identically.
+NO_SPEECH_MAX = 0.60
+#: A forced decode in the wrong language degrades to about -1.2; a correct one
+#: sits near -0.05. Rejects a decode that is grammatically incoherent.
+LOGPROB_MIN = -1.00
+#: Shorter than this there is nothing an inspection standard could be built from.
+MIN_TRANSCRIPT_CHARS = 4
+
+_CYRILLIC = re.compile(r"[Ѐ-ӿ]")
+_LATIN = re.compile(r"[A-Za-z]")
+
+
+def transcript_script(text: str) -> str:
+    """Which alphabet the transcript is actually written in."""
+    cyr = len(_CYRILLIC.findall(text or ""))
+    lat = len(_LATIN.findall(text or ""))
+    if cyr == 0 and lat == 0:
+        return "none"
+    return "cyrillic" if cyr > lat else "latin"
+
+
+#: The alphabet each forced decode is expected to produce.
+_EXPECTED_SCRIPT = {"en": "latin", "ru": "cyrillic"}
+_SCRIPT_LANGUAGE = {"latin": "en", "cyrillic": "ru"}
+
+
+def language_from_script(text: str, fallback: str) -> str:
+    """The language this transcript is actually written in.
+
+    A forced decode is not always honoured, so the language Foreman *asked* for
+    is not proof of what came back. Reporting the requested language regardless
+    would send Latin text to the Russian lexicon in host/standard_parser.py,
+    which matches nothing - and a standard that grounds nothing hands the verdict
+    to the vision-language model alone, which is the failure this whole layer
+    exists to prevent.
+    """
+    return _SCRIPT_LANGUAGE.get(transcript_script(text), fallback)
+
+
+def script_agrees(language: str, text: str) -> bool:
+    """True when a forced decode produced the alphabet that language is written in.
+
+    Whisper does not always honour a forced language: asked for Russian on the
+    English clip "There must be no phone in view" it returned that English
+    sentence verbatim. Such a decode is evidence *against* the language it was
+    forced into, so it must not be allowed to win on likelihood alone.
+    """
+    expected = _EXPECTED_SCRIPT.get(language)
+    if expected is None:
+        return True
+    script = transcript_script(text)
+    return script in (expected, "none")
+
+
+def choose_transcript(candidates: list[dict]) -> dict | None:
+    """Pick the best of several forced decodes of the same audio.
+
+    Candidates whose alphabet contradicts the language they were forced into are
+    discarded first; the most likely of what remains wins. If that rule discards
+    everything, fall back to plain likelihood so the caller always gets an answer.
+    """
+    usable = [c for c in candidates if c.get("text", "").strip()]
+    if not usable:
+        return candidates[0] if candidates else None
+    agreeing = [c for c in usable if script_agrees(c.get("language", ""), c.get("text", ""))]
+    pool = agreeing or usable
+    return max(pool, key=lambda c: float(c.get("avg_logprob", -99.0)))
+
+
+def assess_transcript(text: str, no_speech_prob: float, avg_logprob: float) -> tuple[bool, str]:
+    """Decide whether a transcript is good enough to become an inspection standard.
+
+    Returns (accepted, reason). A rejected transcript must never replace the
+    standard in force: silently adopting a garbled rule is the failure mode that
+    makes an inspection system untrustworthy.
+    """
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return False, "no speech was detected"
+    if no_speech_prob >= NO_SPEECH_MAX:
+        # Whisper hallucinates confidently on silence - it produced
+        # "СПОКОЙНАЯ МУЗЫКА" for pink noise at a healthy -0.53 logprob - so
+        # likelihood alone cannot catch this and no_speech_prob must.
+        return False, "the recording does not appear to contain speech"
+    if avg_logprob <= LOGPROB_MIN:
+        return False, "the speech could not be recognised clearly"
+    if len(cleaned) < MIN_TRANSCRIPT_CHARS or not re.search(r"[^\W\d_]", cleaned, re.UNICODE):
+        return False, "the transcript was too short to be a standard"
+    return True, ""
 
 
 # ------------------------------------------------------- GenAI over HTTP
@@ -300,11 +408,16 @@ class GenAI:
                 metrics[dst] = float(usage[src])
         return parse_window_judgement(text, n), metrics
 
-    def transcribe(self, audio: bytes, filename: str) -> dict:
-        """Whisper on the MLA, via the server's /v1/audio/transcriptions."""
+    def transcribe_forced(self, audio: bytes, filename: str, language: str) -> dict:
+        """One Whisper decode on the MLA with the language pinned.
+
+        The server honours an explicit ISO code and skips its own language
+        detection entirely, which is the whole point: the detection stage is what
+        chose Bulgarian for English speech.
+        """
         body, content_type = encode_multipart({
             "model": self.asr_model,
-            "language": "auto",
+            "language": language,
         }, "file", filename, audio)
         req = urllib.request.Request(
             self.base_url + "/v1/audio/transcriptions",
@@ -313,14 +426,68 @@ class GenAI:
         started = time.monotonic()
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:
             result = json.loads(resp.read().decode())
-        elapsed_ms = (time.monotonic() - started) * 1000.0
         return {
-            "text": result.get("text", ""),
-            "language": result.get("language", "unknown"),
+            "text": (result.get("text") or "").strip(),
+            # Trust what we asked for, not what the server echoes back.
+            "language": language,
+            "avg_logprob": float(result.get("avg_logprob", 0.0) or 0.0),
             "no_speech_prob": float(result.get("no_speech_prob", 0.0) or 0.0),
-            "metrics": {"inference_ms": round(elapsed_ms, 1)},
+            "inference_ms": round((time.monotonic() - started) * 1000.0, 1),
         }
 
+    def transcribe(self, audio: bytes, filename: str, mode: str = "auto") -> dict:
+        """Transcribe speech, constrained to English or Russian.
+
+        `mode` is "en" or "ru" to pin the language, or "auto" to let Foreman
+        choose between exactly those two. Auto never asks the server to detect a
+        language: it decodes the clip both ways and keeps the better reading, so
+        a third language cannot be returned however the audio sounds.
+        """
+        mode = mode if mode in SPEECH_MODES else "auto"
+        if mode in SPEECH_LANGUAGES:
+            best = self.transcribe_forced(audio, filename, mode)
+            # Pinning Russian and then speaking English returns the English
+            # sentence verbatim (measured - see docs/BENCHMARKS.md 4.1). Label it
+            # for what it is rather than for what was asked.
+            best = dict(best, language=language_from_script(best["text"], mode))
+            candidates = [best]
+        else:
+            candidates = []
+            for lang in SPEECH_LANGUAGES:
+                cand = self.transcribe_forced(audio, filename, lang)
+                candidates.append(cand)
+                # Measured on this server, no_speech_prob is byte-identical
+                # across both forced languages for the same clip - it is derived
+                # from the audio, not from the decode. If the clip has no speech
+                # in it a second pass cannot change that, so stop and save the
+                # latency.
+                if cand["no_speech_prob"] >= NO_SPEECH_MAX:
+                    break
+            best = choose_transcript(candidates) or candidates[0]
+            # If both decodes contradicted their forced language, the winner
+            # still carries a label its own alphabet disagrees with. Correct it.
+            best = dict(best, language=language_from_script(best["text"],
+                                                            best["language"]))
+
+        accepted, why = assess_transcript(
+            best["text"], best["no_speech_prob"], best["avg_logprob"])
+        return {
+            "text": best["text"],
+            "language": best["language"],
+            "mode": mode,
+            "accepted": accepted,
+            "reject_reason": why,
+            "avg_logprob": best["avg_logprob"],
+            "no_speech_prob": best["no_speech_prob"],
+            "candidates": [
+                {"language": c["language"], "text": c["text"],
+                 "avg_logprob": c["avg_logprob"]} for c in candidates
+            ],
+            "metrics": {
+                "inference_ms": round(sum(c["inference_ms"] for c in candidates), 1),
+                "asr_calls": len(candidates),
+            },
+        }
 
 def _strip_fence(raw: str) -> str:
     raw = (raw or "").strip()
@@ -1151,12 +1318,13 @@ def make_handler(genai: GenAI, args):
             return self.rfile.read(length) if length else b""
 
         def do_POST(self):
-            if self.path == "/inspect":
+            route, _, query = self.path.partition("?")
+            if route == "/inspect":
                 return self._inspect()
-            if self.path == "/inspect_single":
+            if route == "/inspect_single":
                 return self._inspect_single()
-            if self.path == "/transcribe":
-                return self._transcribe()
+            if route == "/transcribe":
+                return self._transcribe(query)
             return self._json(404, {"error": "not found"})
 
         def _inspect(self):
@@ -1291,15 +1459,16 @@ def make_handler(genai: GenAI, args):
                 "metrics": metrics,
             })
 
-        def _transcribe(self):
+        def _transcribe(self, query: str = ""):
             body = self._read_body()
             if not body:
                 return self._json(400, {"error": "empty upload"})
             audio, filename = extract_uploaded_file(body, self.headers.get("Content-Type", ""))
             if not audio:
                 return self._json(400, {"error": "no file part in upload"})
+            mode = (urllib.parse.parse_qs(query).get("language") or ["auto"])[0]
             try:
-                return self._json(200, genai.transcribe(audio, filename))
+                return self._json(200, genai.transcribe(audio, filename, mode))
             except (urllib.error.URLError, OSError, ValueError) as exc:
                 return self._json(502, {"error": f"speech recognition unavailable: {exc}"})
 

@@ -506,3 +506,205 @@ def test_missing_reason_falls_back_to_the_evidence_list():
 def test_missing_reason_and_evidence_says_so_plainly():
     j = fe.parse_window_judgement('{"verdict":"PASS","per_frame":[true,true,true]}', 3)
     assert j["reason"] == "No reason given."
+
+
+# --- speech language control -------------------------------------------
+#
+# Thresholds and the dual-decode rule were calibrated on the DevKit against
+# whisper-small-a16w8; the numbers used below are measured, not invented.
+
+def test_script_detection():
+    assert fe.transcript_script("This person must be holding a phone.") == "latin"
+    assert fe.transcript_script("человек должен держать телефон") == "cyrillic"
+    assert fe.transcript_script("...") == "none"
+
+
+def test_script_agreement_rejects_a_decode_in_the_wrong_alphabet():
+    # Measured: forced-ru on English audio returned the English sentence verbatim.
+    assert not fe.script_agrees("ru", "There must be no phone in view.")
+    assert fe.script_agrees("ru", "человек должен держать телефон")
+    assert fe.script_agrees("en", "There must be no phone in view.")
+    assert not fe.script_agrees("en", "человек должен держать телефон")
+
+
+def test_auto_picks_english_for_english_audio():
+    # e1.wav, measured on the DevKit.
+    best = fe.choose_transcript([
+        {"language": "en", "text": "This person must be holding a phone.",
+         "avg_logprob": -0.061},
+        {"language": "ru", "text": "Это человек должен быть держит телефон.",
+         "avg_logprob": -1.230},
+    ])
+    assert best["language"] == "en"
+
+
+def test_auto_picks_russian_for_russian_audio():
+    # r1.wav, measured on the DevKit.
+    best = fe.choose_transcript([
+        {"language": "en", "text": "A person should hold the phone.",
+         "avg_logprob": -0.512},
+        {"language": "ru", "text": "человек должен держать телефон.",
+         "avg_logprob": -0.056},
+    ])
+    assert best["language"] == "ru"
+
+
+def test_script_disagreement_beats_likelihood():
+    """A forced-ru decode that emits Latin text is evidence against Russian.
+
+    Measured case e3.wav: asked for Russian, Whisper returned the English
+    sentence. Without the script rule a higher-likelihood wrong-language decode
+    could win.
+    """
+    best = fe.choose_transcript([
+        {"language": "en", "text": "There must be no phone in view.",
+         "avg_logprob": -0.900},
+        {"language": "ru", "text": "There must be no phone in view.",
+         "avg_logprob": -0.238},
+    ])
+    assert best["language"] == "en"
+
+
+def test_choose_transcript_ignores_empty_decodes():
+    best = fe.choose_transcript([
+        {"language": "en", "text": "", "avg_logprob": -0.01},
+        {"language": "ru", "text": "человек должен держать телефон", "avg_logprob": -0.4},
+    ])
+    assert best["language"] == "ru"
+
+
+def test_good_speech_is_accepted():
+    ok, why = fe.assess_transcript("This person must be holding a phone.", 0.0025, -0.061)
+    assert ok and why == ""
+
+
+def test_silence_is_rejected_despite_a_confident_hallucination():
+    """Whisper invents text for silence at a healthy likelihood.
+
+    Measured: pink noise produced "СПОКОЙНАЯ МУЗЫКА" at avg_logprob -0.529, which
+    a likelihood threshold alone would accept. no_speech_prob was 0.905.
+    """
+    ok, why = fe.assess_transcript("СПОКОЙНАЯ МУЗЫКА", 0.905, -0.529)
+    assert not ok
+    assert "speech" in why
+
+
+def test_incoherent_decode_is_rejected():
+    ok, why = fe.assess_transcript("Это человек должен быть держит телефон.", 0.004, -1.230)
+    assert not ok
+
+
+def test_empty_and_trivial_transcripts_are_rejected():
+    assert not fe.assess_transcript("", 0.001, -0.05)[0]
+    assert not fe.assess_transcript("you", 0.001, -0.05)[0]
+    assert not fe.assess_transcript("...", 0.001, -0.05)[0]
+
+
+def test_choose_transcript_handles_an_empty_candidate_list():
+    assert fe.choose_transcript([]) is None
+
+
+def test_choose_transcript_falls_back_when_every_decode_is_empty():
+    cands = [{"language": "en", "text": "", "avg_logprob": -0.1},
+             {"language": "ru", "text": "   ", "avg_logprob": -0.2}]
+    assert fe.choose_transcript(cands) is cands[0]
+
+
+def test_choose_transcript_falls_back_when_no_script_agrees():
+    """Both decodes contradict their forced language: likelihood then decides
+    rather than the caller getting nothing back."""
+    best = fe.choose_transcript([
+        {"language": "en", "text": "человек", "avg_logprob": -0.90},
+        {"language": "ru", "text": "hello there", "avg_logprob": -0.20},
+    ])
+    assert best is not None
+    assert best["language"] == "ru"
+
+
+def test_assess_transcript_thresholds_are_inclusive():
+    """The documented boundaries are rejections, not acceptances."""
+    assert not fe.assess_transcript("a real sentence", fe.NO_SPEECH_MAX, -0.05)[0]
+    assert fe.assess_transcript("a real sentence", fe.NO_SPEECH_MAX - 0.001, -0.05)[0]
+    assert not fe.assess_transcript("a real sentence", 0.01, fe.LOGPROB_MIN)[0]
+    assert fe.assess_transcript("a real sentence", 0.01, fe.LOGPROB_MIN + 0.001)[0]
+
+
+# --- GenAI.transcribe: the mode logic, with the network stubbed out -----
+
+class _StubGenAI(fe.GenAI):
+    """Exercises transcribe()'s language logic without a DevKit.
+
+    Only the single network call is replaced; the mode handling, early break and
+    candidate selection under test are the real implementation.
+    """
+
+    def __init__(self, replies):
+        super().__init__("http://stub", "vlm", "asr")
+        self.replies = replies
+        self.calls = []
+
+    def transcribe_forced(self, audio, filename, language):
+        self.calls.append(language)
+        return dict(self.replies[language], language=language, inference_ms=240.0)
+
+
+_EN = {"text": "This person must be holding a phone.", "avg_logprob": -0.061,
+       "no_speech_prob": 0.0025}
+_RU = {"text": "человек должен держать телефон.", "avg_logprob": -0.056,
+       "no_speech_prob": 0.0046}
+
+
+def test_forced_mode_makes_exactly_one_call():
+    g = _StubGenAI({"en": _EN, "ru": _RU})
+    out = g.transcribe(b"audio", "s.wav", "ru")
+    assert g.calls == ["ru"]
+    assert out["language"] == "ru"
+    assert out["mode"] == "ru"
+    assert out["metrics"]["asr_calls"] == 1
+
+
+def test_auto_mode_decodes_both_languages():
+    g = _StubGenAI({"en": dict(_EN, avg_logprob=-1.20), "ru": _RU})
+    out = g.transcribe(b"audio", "s.wav", "auto")
+    assert g.calls == ["en", "ru"]
+    assert out["language"] == "ru", "the more likely reading must win"
+    assert out["metrics"]["asr_calls"] == 2
+    assert len(out["candidates"]) == 2
+
+
+def test_auto_mode_stops_early_when_there_is_no_speech():
+    """no_speech_prob comes from the audio, not the decode, so a second pass
+    cannot change it. Spending it would double the latency for nothing."""
+    silent = {"text": "you", "avg_logprob": -0.48, "no_speech_prob": 0.944}
+    g = _StubGenAI({"en": silent, "ru": silent})
+    out = g.transcribe(b"audio", "s.wav", "auto")
+    assert g.calls == ["en"], "must not decode a second time for silent audio"
+    assert out["accepted"] is False
+    assert out["metrics"]["asr_calls"] == 1
+
+
+def test_an_unknown_mode_falls_back_to_auto():
+    g = _StubGenAI({"en": _EN, "ru": _RU})
+    out = g.transcribe(b"audio", "s.wav", "bg")
+    assert out["mode"] == "auto"
+    assert out["language"] in ("en", "ru"), "a third language can never be returned"
+
+
+def test_forced_mode_reports_the_language_the_text_is_actually_in():
+    """Asked for Russian, handed English: say English.
+
+    Labelling it "ru" would send Latin text to the Russian lexicon on the Mac,
+    which matches nothing and silently removes detector grounding.
+    """
+    english_back = {"text": "There must be no phone in view.", "avg_logprob": -0.238,
+                    "no_speech_prob": 0.003}
+    g = _StubGenAI({"en": _EN, "ru": english_back})
+    out = g.transcribe(b"audio", "s.wav", "ru")
+    assert g.calls == ["ru"]
+    assert out["language"] == "en", "the label must follow the alphabet, not the request"
+
+
+def test_language_from_script():
+    assert fe.language_from_script("There must be no phone.", "ru") == "en"
+    assert fe.language_from_script("человек должен держать телефон", "en") == "ru"
+    assert fe.language_from_script("123", "ru") == "ru"
