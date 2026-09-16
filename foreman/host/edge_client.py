@@ -33,7 +33,7 @@ from __future__ import annotations
 import base64
 import json
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import httpx
 
@@ -74,7 +74,13 @@ class WindowEvidence:
     detector_summary: str
     selected: list[SelectedFrame]
     vlm: dict
+    #: one judgement per rule, in rule order, all from the SAME selected frames.
+    #: A single-rule inspection has exactly one entry and it equals `vlm`.
+    vlms: list[dict]
     metrics: dict
+    #: how this window was gathered: mode ("manual"/"auto"), the requested
+    #: duration, the real start/end and how many detector frames it covered
+    capture: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -197,19 +203,43 @@ class EdgeClient:
         prohibited: list[str],
         window_s: float,
         num_frames: int,
+        capture_s: float = 0.0,
+        relation: str | None = None,
+        relation_subject: str | None = None,
+        relation_object: str | None = None,
+        relation_expected: bool | None = None,
+        rules: list[dict] | None = None,
     ) -> WindowEvidence:
-        """Ask the DevKit to judge a rolling evidence window.
+        """Ask the edge to judge an evidence window.
 
-        One multi-image VLM call on the MLA; takes a few seconds.
+        One multi-image VLM call; takes a few seconds. `capture_s` > 0 switches
+        to manual capture: the edge collects that many seconds of *new* frames
+        from the moment of the call, instead of using the rolling buffer.
         """
         try:
-            r = await self._client.post("/inspect", json={
+            body = {
                 "standard": standard,
                 "required_objects": required,
                 "prohibited_objects": prohibited,
                 "window_s": window_s,
                 "num_frames": num_frames,
-            })
+                "capture_s": capture_s,
+            }
+            # Only sent for a relationship standard, so a presence rule produces
+            # exactly the request - and exactly the prompt - it always did.
+            if relation and relation_subject and relation_object:
+                body["relation"] = {
+                    "name": relation,
+                    "subject": relation_subject,
+                    "object": relation_object,
+                    "expected": bool(relation_expected),
+                }
+            # One capture, one detector pass, one frame selection - then one
+            # judgement per rule over those same frames. Sent as a list so the
+            # edge never has to re-open the camera for the second rule.
+            if rules:
+                body["rules"] = rules
+            r = await self._client.post("/inspect", json=body)
             r.raise_for_status()
             obj = r.json()
         except httpx.HTTPError as exc:
@@ -244,7 +274,12 @@ class EdgeClient:
             detector_summary=str(obj.get("detector_summary", "")),
             selected=selected,
             vlm=obj.get("vlm") or {},
+            # An edge that predates multi-rule returns only "vlm"; treat that as
+            # a single-rule answer rather than failing the inspection.
+            vlms=[j for j in (obj.get("vlms") or []) if isinstance(j, dict)]
+                 or [obj.get("vlm") or {}],
             metrics={k: float(v) for k, v in (obj.get("metrics") or {}).items()},
+            capture=obj.get("capture") or {},
         )
 
     async def transcribe(self, audio: bytes, filename: str = "speech.wav",

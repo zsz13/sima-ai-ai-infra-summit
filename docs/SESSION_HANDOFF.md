@@ -106,7 +106,7 @@ URLs: console `http://127.0.0.1:8800`, Insight viewer
 ## Git
 
 - Repo root `/Users/d/workspace`; remote `origin` =
-  `git@github.com:zsz13/sima-ai-ai-infra-summit-hackathon.git`
+  `git@github.com:zsz13/sima-ai-ai-infra-summit.git`
 - Branch **`feat/foreman-temporal-grounding`**, pushed. `main` is local only and
   shares **no ancestor** with `origin/main` (a LICENSE-only initial commit).
 - Key commits: `9943a5c` single-frame baseline, `b7c977d` temporal grounding,

@@ -8,6 +8,7 @@ orchestrator-level tests, so it is checked here against the real FastAPI app.
 
 from __future__ import annotations
 
+import io as _io
 import os
 import sys
 from pathlib import Path
@@ -127,3 +128,109 @@ def test_typed_standard_reports_its_parse():
 
 def test_typed_standard_rejects_an_empty_string():
     assert client.post("/api/standard", json={"text": "   "}).status_code == 400
+
+
+# --- selected export over HTTP -------------------------------------------
+
+def test_export_endpoints_accept_an_ids_filter(tmp_path, monkeypatch):
+    """The ids filter must reach the export, and an unknown id must not 500."""
+    import json as _json
+
+    trail = tmp_path / "inspections.jsonl"
+    recs = [{"id": f"rec{i}", "ts": 1789527560.0 + i, "verdict": "pass",
+             "reason": "ok", "standard": "человек должен держать телефон.",
+             "metrics": {}, "frames": []} for i in range(3)]
+    trail.write_text("\n".join(_json.dumps(r, ensure_ascii=False) for r in recs) + "\n",
+                     encoding="utf-8")
+    monkeypatch.setattr(app_module, "AUDIT_FILE", trail)
+    monkeypatch.setattr(app_module, "EVIDENCE_DIR", tmp_path / "evidence")
+
+    import csv as _csv
+    import io as _io
+
+    all_rows = list(_csv.DictReader(_io.StringIO(client.get("/api/export.csv").text)))
+    assert len(all_rows) == 3
+
+    one = list(_csv.DictReader(_io.StringIO(client.get("/api/export.csv?ids=rec1").text)))
+    assert [r["inspection_id"] for r in one] == ["rec1"]
+
+    two = list(_csv.DictReader(_io.StringIO(client.get("/api/export.csv?ids=rec0,rec2").text)))
+    assert [r["inspection_id"] for r in two] == ["rec0", "rec2"]
+
+    ghost = list(_csv.DictReader(_io.StringIO(client.get("/api/export.csv?ids=nope").text)))
+    assert ghost == []
+
+    # a path-shaped id must be sanitised away, not resolved
+    r = client.get("/api/export.csv?ids=../../etc/passwd")
+    assert r.status_code == 200
+    assert list(_csv.DictReader(_io.StringIO(r.text))) == []
+
+
+def test_selected_zip_downloads_and_is_named_as_a_selection(tmp_path, monkeypatch):
+    import json as _json
+    import zipfile as _zip
+
+    trail = tmp_path / "inspections.jsonl"
+    trail.write_text(_json.dumps({"id": "abc", "ts": 1.0, "verdict": "pass",
+                                  "reason": "ok", "standard": "s", "metrics": {}}) + "\n")
+    monkeypatch.setattr(app_module, "AUDIT_FILE", trail)
+    monkeypatch.setattr(app_module, "EVIDENCE_DIR", tmp_path / "evidence")
+    r = client.get("/api/export.zip?ids=abc")
+    assert r.status_code == 200
+    assert "-selected-" in r.headers["content-disposition"]
+    with _zip.ZipFile(_io.BytesIO(r.content)) as z:
+        assert z.testzip() is None
+        assert "report.csv" in z.namelist()
+
+
+# --- setting one or two rules through the API --------------------------------
+
+def test_the_api_still_accepts_a_single_text():
+    r = client.post("/api/standard", json={"text": "A person must be visible."})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["standard"] == "A person must be visible."
+    assert body["rules"] == ["A person must be visible."]
+
+
+def test_the_api_accepts_two_rules():
+    r = client.post("/api/standard", json={
+        "rules": ["The person must be holding a phone.",
+                  "The person must NOT be holding a bottle."]})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["rules"] == ["The person must be holding a phone.",
+                             "The person must NOT be holding a bottle."]
+    assert len(body["parsed_rules"]) == 2
+    assert body["parsed_rules"][1]["relation_expected"] is False
+
+
+def test_the_api_refuses_three_rules():
+    r = client.post("/api/standard", json={
+        "rules": ["A person must be visible.", "There must be no phone in view.",
+                  "There must be no bottle in view."]})
+    assert r.status_code == 400
+    assert "two" in r.text.lower()
+
+
+def test_the_api_refuses_an_empty_rule_list():
+    assert client.post("/api/standard", json={"rules": []}).status_code == 400
+    assert client.post("/api/standard", json={"rules": ["  "]}).status_code == 400
+
+
+def test_state_exposes_the_rules_for_the_console():
+    client.post("/api/standard", json={
+        "rules": ["A person must be visible.", "There must be no bottle in view."]})
+    body = client.get("/api/state").json()
+    assert body["rules"] == ["A person must be visible.",
+                             "There must be no bottle in view."]
+    assert len(body["parsed_rules"]) == 2
+
+
+def test_clear_session_empties_the_rules():
+    client.post("/api/standard", json={"rules": ["A person must be visible.",
+                                                 "There must be no bottle in view."]})
+    client.post("/api/session/clear")
+    body = client.get("/api/state").json()
+    assert body["rules"] == []
+    assert body["standard"] == ""

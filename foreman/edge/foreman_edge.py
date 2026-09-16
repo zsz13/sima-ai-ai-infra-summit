@@ -93,17 +93,23 @@ class EvidenceBuffer:
     to pick 3 well-separated representatives without paying to encode every frame.
     """
 
-    def __init__(self, window_s: float = 3.0, max_frames: int = 300) -> None:
+    def __init__(self, window_s: float = 3.0, max_frames: int = 300,
+                 retain_s: float | None = None) -> None:
         self._lock = threading.Lock()
         self._frames: deque[FrameRecord] = deque(maxlen=max_frames)
         self.window_s = window_s
+        #: How far back frames are kept, which is not the same as the default
+        #: judging window. A manual capture asks for a longer span than the
+        #: rolling window, and pruning to window_s would throw away the start of
+        #: it before the capture finished.
+        self.retain_s = max(window_s, retain_s or window_s)
         self.detector_ms: float = 0.0
 
     def add(self, record: FrameRecord, detector_ms: float) -> None:
         with self._lock:
             self._frames.append(record)
             self.detector_ms = detector_ms
-            cutoff = record.ts - self.window_s
+            cutoff = record.ts - self.retain_s
             while self._frames and self._frames[0].ts < cutoff:
                 self._frames.popleft()
 
@@ -115,6 +121,15 @@ class EvidenceBuffer:
             span = self.window_s if seconds is None else seconds
             cutoff = self._frames[-1].ts - span
             return [f for f in self._frames if f.ts >= cutoff]
+
+    def between(self, start_ts: float, end_ts: float) -> list[FrameRecord]:
+        """Frames captured within an explicit span, oldest first.
+
+        Manual inspection judges what happened *after* the operator pressed the
+        button, so it needs an absolute span rather than "the last N seconds".
+        """
+        with self._lock:
+            return [f for f in self._frames if start_ts <= f.ts <= end_ts]
 
     def latest(self) -> FrameRecord | None:
         with self._lock:
@@ -137,6 +152,8 @@ class EvidenceBuffer:
                     "detector_ms": round(self.detector_ms, 2)}
 
 
+#: Retention is set from the CLI at startup (see main); the default here only
+#: matters before then.
 LATEST = EvidenceBuffer()
 SUBSCRIBERS: set[queue.Queue] = set()
 SUBSCRIBERS_LOCK = threading.Lock()
@@ -261,6 +278,159 @@ def assess_transcript(text: str, no_speech_prob: float, avg_logprob: float) -> t
 
 # ------------------------------------------------------- GenAI over HTTP
 
+def capture_window(buf, capture_s: float, timeout_pad: float = 3.0):
+    """Collect a fresh evidence window starting now, for manual inspection.
+
+    Blocks until `capture_s` of NEW frames have arrived, then returns exactly
+    those frames. Deliberately not `buf.window(capture_s)`: that would return the
+    seconds *before* the call, and a manual inspection is a statement about what
+    happens after the operator presses the button.
+
+    Returns (frames, start_ts, end_ts). Gives up after capture_s + timeout_pad so
+    a stalled camera cannot hang the request forever.
+    """
+    # The press itself is the boundary, not the last frame already buffered:
+    # using that frame's timestamp would let one pre-press frame into the window,
+    # and a manual inspection is a claim about what happened afterwards.
+    start_ts = time.time()
+    deadline = time.monotonic() + capture_s + timeout_pad
+    end_ts = start_ts + capture_s
+    while time.monotonic() < deadline:
+        newest = buf.latest()
+        if newest is not None and newest.ts >= end_ts:
+            break
+        time.sleep(0.05)
+    frames = buf.between(start_ts, end_ts)
+    return frames, start_ts, (frames[-1].ts if frames else end_ts)
+
+
+#: The prose values in the prompt's JSON example, in the order they appear:
+#: evidence, missing_evidence, reason. A small model shown six images returns the
+#: right structured answer but sometimes reproduces these word for word, which
+#: put "No phone is visible in any frame." on a correct PASS and then tripped the
+#: detector-contradiction guard. They live here so build_window_prompt() writes
+#: them and parse_window_judgement() can recognise them; the two cannot drift.
+_EXAMPLE_PROSE = (
+    "hands are visible and empty",
+    "any phone in the hand",
+    "No phone is visible in any frame.",
+)
+
+
+def build_window_prompt(n: int, standard: str, detector_summary: str,
+                        roi_label: str | None = None, roi_count: int = 0,
+                        confirmed: list[str] | None = None,
+                        relation: str | None = None,
+                        relation_subject: str | None = None,
+                        relation_object: str | None = None,
+                        relation_expected: bool | None = None) -> str:
+    """The judging prompt for one evidence window.
+
+    Shared by both backends so the instructions cannot drift apart;
+    tests/test_edge_pure.py pins the exact text.
+
+    `confirmed` names objects the detector measured as reliably present. Those
+    are stated as settled fact and the model is told its job is the relationship,
+    not presence. Without it the model answered a question it had not been asked:
+    with a phone detected in 42 of 45 frames at 85% confidence it still replied
+    "No phone is visible in any frame."
+    """
+    if roi_label and roi_count:
+        wide = n - roi_count
+        layout = (
+            f"You are shown {n} images from about three seconds of video. "
+            f"The first {wide} show the whole scene, in time order. "
+            f"The remaining {roi_count} are close-up crops of the {roi_label} "
+            f"from the same window, enlarged so you can see detail. "
+            f"Use the close-ups to judge small features, and the wide shots for "
+            f"context and relationships.\n\n")
+    else:
+        layout = (f"You are shown {n} still frames captured over about three "
+                  "seconds, in time order.\n\n")
+    if confirmed:
+        listed = "".join(f"- {c}\n" for c in confirmed)
+        grounded = (
+            "DETECTOR-CONFIRMED FACTS. These were measured across the window and "
+            "are authoritative for whether an object is present:\n"
+            f"{listed}"
+            "Treat the presence of those objects as settled. Do NOT say any of "
+            "them is absent, missing or not visible - that question is already "
+            "answered. Judge only the remaining part of the requirement: the "
+            "relationship, position or attribute.\n\n")
+    else:
+        grounded = ""
+
+    # A relationship rule turns on a value, not on presence: "must be holding"
+    # and "must NOT be holding" name the same relationship and disagree only
+    # about what it should be. The prompt therefore states the expected value and
+    # asks for the OBSERVED one. Deciding whether the observation passes is
+    # policy, and policy is applied deterministically in host/policy.py rather
+    # than left to the model.
+    if relation and relation_subject and relation_object:
+        want = "true" if relation_expected else "false"
+        rel_block = (
+            "RELATIONSHIP TO JUDGE:\n"
+            f"- relationship: {relation}({relation_subject}, {relation_object})\n"
+            f"- the standard is met when {relation} = {want}\n"
+            f"Decide only one thing: in these frames, is the {relation_subject} "
+            f"actually {relation} the {relation_object}?\n"
+            "Report what you OBSERVE. Do not report whether the rule passes - "
+            "that is decided elsewhere from your observation.\n"
+            f'Put it in "observed_relationship" as exactly one of: '
+            f'"{relation}", "not_{relation}", "unclear".\n'
+            f"The {relation_object} being somewhere in the frame is NOT enough: "
+            f'answer "{relation}" only if the {relation_subject} is holding it.\n\n')
+        rel_field = f'"observed_relationship":"{relation}|not_{relation}|unclear",'
+    else:
+        rel_block = ""
+        rel_field = ""
+
+    return (
+        "You are a careful visual inspection system. " + layout +
+        f"REQUIREMENT: {standard}\n\n"
+        f"DETECTOR EVIDENCE (measured, not your opinion):\n{detector_summary}\n\n"
+        + grounded + rel_block +
+        "Rules you must follow:\n"
+        "- Judge ONLY what is directly visible in these frames.\n"
+        "- Never state that an object is present unless you can actually see it.\n"
+        "- Never infer an object from context, from the scene type, or from what "
+        "would usually be there.\n"
+        "- Keep what you SEE separate from what you ASSUME. Report only what you see.\n"
+        "- Use all the frames together: an object briefly hidden in one frame but "
+        "clearly visible in others is still present.\n"
+        "- If the frames disagree with each other, answer UNCLEAR.\n"
+        "- If you cannot see enough to decide, answer UNCLEAR.\n"
+        "- If the detector evidence says a required object was never found, you "
+        "may not claim it is present.\n"
+        "- Equally, if an object is listed as detector-confirmed above, you may "
+        "not claim it is absent. Judge the relationship instead.\n"
+        "- Write about the objects this requirement names. Do not describe "
+        "unrelated things in the scene.\n\n"
+        "Answer with JSON only, no other text, and keep it SHORT - every "
+        "string under 15 words, at most two items per list:\n"
+        "Follow this shape exactly, but write your own values - never copy the "
+        "example text:\n"
+        # These three strings are the example prose, and they are also listed in
+        # _EXAMPLE_PROSE so the parser can recognise them if they come back
+        # verbatim. Keeping a realistic example measurably produces better
+        # wording than an angle-bracket placeholder, which the small model simply
+        # copies instead, leaving no usable reason at all. The echo is therefore
+        # detected rather than prevented.
+        '{"meets_requirement":false,"verdict":"FAIL",'
+        f'"per_frame":[{",".join(["false"] * n)}],'
+        + rel_field +
+        f'"evidence":["{_EXAMPLE_PROSE[0]}"],'
+        f'"missing_evidence":["{_EXAMPLE_PROSE[1]}"],'
+        f'"reason":"{_EXAMPLE_PROSE[2]}"}}\n'
+        f'"per_frame" must have exactly {n} entries, one per frame in order: '
+        "true if that frame supports the requirement, false if it contradicts "
+        "it, null if you cannot tell from that frame. Do not describe the "
+        "frames individually.\n"
+        'Set "verdict" to "PASS" only when "meets_requirement" is true, and to '
+        '"FAIL" when it is false. The two must agree.'
+    )
+
+
 class GenAI:
     """Client for the Neat GenAI server (OpenAI-compatible) on this board."""
 
@@ -326,7 +496,9 @@ class GenAI:
 
     def judge_window(self, jpegs: list[bytes], standard: str,
                      detector_summary: str, roi_label: str | None = None,
-                     roi_count: int = 0) -> tuple[dict, dict]:
+                     roi_count: int = 0,
+                     confirmed: list[str] | None = None,
+                     relation: tuple[str, str, str, bool] | None = None) -> tuple[dict, dict]:
         """Judge a short evidence window from several frames in ONE request.
 
         Multi-image support was verified on this hardware: three images in one
@@ -339,50 +511,12 @@ class GenAI:
         constraint is enforced on the Mac, in host/policy.py, not here.
         """
         n = len(jpegs)
-        if roi_label and roi_count:
-            wide = n - roi_count
-            layout = (
-                f"You are shown {n} images from about three seconds of video. "
-                f"The first {wide} show the whole scene, in time order. "
-                f"The remaining {roi_count} are close-up crops of the {roi_label} "
-                f"from the same window, enlarged so you can see detail. "
-                f"Use the close-ups to judge small features, and the wide shots for "
-                f"context and relationships.\n\n")
-        else:
-            layout = (f"You are shown {n} still frames captured over about three "
-                      "seconds, in time order.\n\n")
-        prompt = (
-            "You are a careful visual inspection system. " + layout +
-            f"REQUIREMENT: {standard}\n\n"
-            f"DETECTOR EVIDENCE (measured, not your opinion):\n{detector_summary}\n\n"
-            "Rules you must follow:\n"
-            "- Judge ONLY what is directly visible in these frames.\n"
-            "- Never state that an object is present unless you can actually see it.\n"
-            "- Never infer an object from context, from the scene type, or from what "
-            "would usually be there.\n"
-            "- Keep what you SEE separate from what you ASSUME. Report only what you see.\n"
-            "- Use all the frames together: an object briefly hidden in one frame but "
-            "clearly visible in others is still present.\n"
-            "- If the frames disagree with each other, answer UNCLEAR.\n"
-            "- If you cannot see enough to decide, answer UNCLEAR.\n"
-            "- If the detector evidence says a required object was never found, you "
-            "may not claim it is present.\n\n"
-            "Answer with JSON only, no other text, and keep it SHORT - every "
-            "string under 15 words, at most two items per list:\n"
-            "Follow this shape exactly, but write your own values - never copy the "
-            "example text:\n"
-            '{"meets_requirement":false,"verdict":"FAIL",'
-            f'"per_frame":[{",".join(["false"] * n)}],'
-            '"evidence":["hands are visible and empty"],'
-            '"missing_evidence":["any phone in the hand"],'
-            '"reason":"No phone is visible in any frame."}\n'
-            f'"per_frame" must have exactly {n} entries, one per frame in order: '
-            "true if that frame supports the requirement, false if it contradicts "
-            "it, null if you cannot tell from that frame. Do not describe the "
-            "frames individually.\n"
-            'Set "verdict" to "PASS" only when "meets_requirement" is true, and to '
-            '"FAIL" when it is false. The two must agree.'
-        )
+        # (name, subject, object, expected) or None for a presence-only rule.
+        rel_name, rel_subj, rel_obj, rel_want = relation or (None, None, None, None)
+        prompt = build_window_prompt(
+            n, standard, detector_summary, roi_label, roi_count, confirmed,
+            relation=rel_name, relation_subject=rel_subj,
+            relation_object=rel_obj, relation_expected=rel_want)
         content = [{"type": "text", "text": prompt}]
         for jpeg in jpegs:
             content.append({"type": "image_url", "image_url": {
@@ -511,6 +645,13 @@ def _clean_text(value, fallback: str) -> str:
         return fallback
     if text.lower() in {"<one short sentence>", "string", "reason", "n/a"}:
         return fallback
+    # A verbatim copy of the prompt's own example is not an observation. It reads
+    # exactly like one, which is what makes it dangerous: it reached the operator
+    # as "No phone is visible in any frame." on an inspection whose detector had
+    # the phone in 45 of 45 frames, and the grounding guard then overturned a
+    # correct PASS on the strength of a sentence the model had merely copied.
+    if text.lower() in {s.lower() for s in _EXAMPLE_PROSE}:
+        return fallback
     return text
 
 
@@ -575,12 +716,22 @@ def parse_window_judgement(text: str, frames_sent: int) -> dict:
     if contradiction:
         reason = f"The model contradicted itself, so this needs a human. {reason}"
 
+    # The observed relationship is an observation, not a verdict: the policy
+    # compares it against the polarity the standard asks for. Normalised here so
+    # "NOT_HOLDING", "not holding" and "not_holding" all mean the same thing.
+    observed = obj.get("observed_relationship")
+    if isinstance(observed, str) and observed.strip():
+        observed = observed.strip().lower().replace(" ", "_").replace("-", "_")
+    else:
+        observed = None
+
     return {
         "verdict": verdict,
         "reason": reason,
         "evidence": strlist("evidence"),
         "missing_evidence": strlist("missing_evidence"),
         "per_frame": per_frame,
+        "observed_relationship": observed,
     }
 
 
@@ -946,6 +1097,68 @@ def detector_summary(frames, required, prohibited) -> str:
     return "\n".join(lines)
 
 
+def confirmed_present(frames, required, present_ratio_min: float = 0.60) -> list[str]:
+    """Required objects the detector saw often enough to call settled.
+
+    The same threshold host/policy.py uses to treat an object as reliably
+    present, so the prompt and the policy agree about what counts as confirmed.
+    These are handed to the model as fact, which is what stops it answering a
+    presence question it was not asked.
+    """
+    total = len(frames)
+    if not total:
+        return []
+    out = []
+    for label in required:
+        present = sum(1 for f in frames
+                      if any(d.get("label") == label for d in f.detections))
+        if present / total >= present_ratio_min:
+            pct = round(100 * present / total)
+            out.append(f"{label} is present in {present}/{total} frames ({pct}%)")
+    return out
+
+
+
+def rule_inputs(body: dict, frames, default_standard: str,
+                default_required: list, default_prohibited: list,
+                default_relation) -> list[dict]:
+    """One judging spec per rule, all against the SAME captured frames.
+
+    A request without "rules" yields exactly one spec built from the top-level
+    fields, so a single-rule inspection is byte-identical to what it was before
+    multi-rule existed.
+
+    Each spec carries only the objects ITS rule names. That scoping is what keeps
+    rule 1's answer from discussing rule 2's objects: the model is never told
+    about a class the rule it is judging does not mention.
+    """
+    raw_rules = body.get("rules") or []
+    if not raw_rules:
+        raw_rules = [{"standard": default_standard,
+                      "required_objects": default_required,
+                      "prohibited_objects": default_prohibited,
+                      "relation": default_relation}]
+    specs = []
+    for r in raw_rules:
+        req = [str(x) for x in (r.get("required_objects") or [])]
+        proh = [str(x) for x in (r.get("prohibited_objects") or [])]
+        rel = r.get("relation") or None
+        name = str(rel.get("name") or "") if rel else ""
+        subj = str(rel.get("subject") or "") if rel else ""
+        obj = str(rel.get("object") or "") if rel else ""
+        want = bool(rel.get("expected")) if rel and name else None
+        scoped = list(req)
+        if obj and obj not in scoped:
+            scoped.append(obj)
+        specs.append({
+            "standard": str(r.get("standard") or default_standard),
+            "summary": detector_summary(frames, scoped, proh),
+            "confirmed": confirmed_present(frames, scoped),
+            "required": req,
+            "relation": (name, subj, obj, want) if name and obj else None,
+        })
+    return specs
+
 def select_representative(frames, required, count: int, min_gap_s: float | None = None):
     """Pick `count` sharp, well-separated frames that show the required objects.
 
@@ -985,6 +1198,28 @@ def select_representative(frames, required, count: int, min_gap_s: float | None 
 
     ranked = sorted(candidates, key=score, reverse=True)
     chosen: list = []
+
+    # Pass 1: one frame per equal slice of the window, best-scoring within each.
+    # Greedy-by-score alone clusters wherever the sharpest frames happen to fall -
+    # measured on a real 3 s capture it put all six frames between +0.88 s and
+    # +2.87 s and left the first second unrepresented, which is not temporal
+    # evidence so much as a burst. Slicing guarantees the window is covered; the
+    # gap check below still rejects two picks that land either side of a boundary
+    # and are effectively the same instant.
+    t0 = candidates[0].ts
+    slice_s = span / count
+    for i in range(count):
+        lo, hi = t0 + i * slice_s, t0 + (i + 1) * slice_s
+        in_slice = [f for f in ranked
+                    if lo <= f.ts < hi or (i == count - 1 and f.ts >= lo)]
+        for rec in in_slice:
+            if all(abs(rec.ts - r.ts) >= min_gap_s for r in chosen):
+                chosen.append(rec)
+                break
+
+    # Pass 2: top up from anywhere if slices were empty or the gap blocked them,
+    # relaxing the gap rather than returning fewer frames - six near frames still
+    # beat three.
     gap = min_gap_s
     while len(chosen) < count and gap >= 0:
         for rec in ranked:
@@ -994,7 +1229,7 @@ def select_representative(frames, required, count: int, min_gap_s: float | None 
                 continue
             if all(abs(rec.ts - r.ts) >= gap for r in chosen):
                 chosen.append(rec)
-        gap = gap / 2 if gap > 0.02 else -1  # relax, then give up on the constraint
+        gap = gap / 2 if gap > 0.02 else -1
 
     return sorted(chosen, key=lambda r: r.ts)
 
@@ -1268,6 +1503,10 @@ def make_handler(genai: GenAI, args):
                 stats = LATEST.stats()
                 return self._json(200, {
                     "ok": True,
+                    # Which inference backend answered. The console and the audit
+                    # trail carry this through so a local development result can
+                    # never be mistaken for one produced on the Modalix MLA.
+                    "backend": "modalix",
                     "models": {"detector": args.model.rsplit("/", 1)[-1],
                                "vlm": args.vlm_model, "asr": args.asr_model},
                     "frame_id": rec.frame_id if rec else 0,
@@ -1347,9 +1586,31 @@ def make_handler(genai: GenAI, args):
             prohibited = [str(x) for x in (body.get("prohibited_objects") or [])]
             window_s = float(body.get("window_s") or args.window_s)
             want = int(body.get("num_frames") or args.evidence_frames)
+            capture_s = float(body.get("capture_s") or 0.0)
+            # Every class any rule needs reported, for the shared window summary
+            # the response carries. Per-rule scoping happens in rule_inputs();
+            # this list is only for the one summary an operator sees.
+            summary_objects = list(required)
+            for extra in [(body.get("relation") or {}).get("object")] + [
+                    (r.get("relation") or {}).get("object") for r in (body.get("rules") or [])]:
+                if extra and str(extra) not in summary_objects:
+                    summary_objects.append(str(extra))
+            for r in (body.get("rules") or []):
+                for c in (r.get("required_objects") or []):
+                    if str(c) not in summary_objects:
+                        summary_objects.append(str(c))
 
             t_sel = time.monotonic()
-            frames = LATEST.window(window_s)
+            if capture_s > 0:
+                # Manual mode: judge what happens from now on, not what is
+                # already in the rolling buffer.
+                frames, cap_start, cap_end = capture_window(LATEST, capture_s)
+                capture = {"mode": "manual", "requested_s": capture_s,
+                           "start_ts": cap_start, "end_ts": cap_end,
+                           "duration_s": round(cap_end - cap_start, 3)}
+            else:
+                frames = LATEST.window(window_s)
+                capture = {"mode": "auto", "requested_s": window_s}
             if not frames:
                 return self._json(503, {"error": "no frames buffered yet"})
             if time.time() - frames[-1].ts > 5.0:
@@ -1360,7 +1621,7 @@ def make_handler(genai: GenAI, args):
                 return self._json(503, {"error": "no encoded frames in the evidence window"})
             selection_ms = (time.monotonic() - t_sel) * 1000.0
 
-            summary = detector_summary(frames, required, prohibited)
+            summary = detector_summary(frames, summary_objects, prohibited)
 
             # Generic attribute inspection: the detector grounds the parent
             # object, and a padded close-up of it gives the model the detail it
@@ -1394,11 +1655,32 @@ def make_handler(genai: GenAI, args):
             if roi_images:
                 # Keep total images bounded: fewer wide shots when ROI crops are added.
                 wide = wide[:max(1, args.evidence_frames - len(roi_images) + 1)]
+            # One judgement per rule, over the SAME `wide` frames. The camera is
+            # never re-opened and the detector never re-runs: this loop is the
+            # only thing that repeats, which is the trade the design accepts to
+            # keep the rules from contaminating each other in one merged prompt.
+            specs = rule_inputs(body, frames, standard, required, prohibited,
+                                    body.get("relation"))
+            vlms, total_ms, calls = [], 0.0, 0
             try:
-                judgement, metrics = genai.judge_window(
-                    wide + roi_images, standard, summary,
-                    roi_label=roi_label if roi_images else None,
-                    roi_count=len(roi_images))
+                for spec in specs:
+                    j, m = genai.judge_window(
+                        wide + roi_images, spec["standard"], spec["summary"],
+                        roi_label=roi_label if roi_images else None,
+                        roi_count=len(roi_images), confirmed=spec["confirmed"],
+                        relation=spec["relation"])
+                    vlms.append(j)
+                    total_ms += float(m.get("inference_ms") or 0.0)
+                    calls += 1
+                    metrics = m
+                # ROI crops are extra views of one moment, not extra moments.
+                # Reporting them as agreeing frames would inflate "6/6 frames in
+                # agreement" with images that carry no new temporal evidence.
+                metrics["temporal_frames"] = len(wide)
+                metrics["inference_ms"] = round(total_ms, 1)
+                metrics["vlm_calls"] = calls
+                metrics["rules_judged"] = len(vlms)
+                judgement = vlms[0]
             except (urllib.error.URLError, OSError, ValueError) as exc:
                 return self._json(502, {"error": f"vision-language model unavailable: {exc}"})
 
@@ -1413,6 +1695,7 @@ def make_handler(genai: GenAI, args):
                     "image_frames": sum(1 for f in frames if f.jpeg is not None),
                 },
                 "detector_summary": summary,
+                "capture": capture | {"detector_frames": len(frames)},
                 "roi": {"label": roi_label, "frames": roi_meta} if roi_images else None,
                 "selected": [{
                     "frame_id": f.frame_id,
@@ -1424,6 +1707,7 @@ def make_handler(genai: GenAI, args):
                     "jpeg_b64": base64.b64encode(f.jpeg).decode(),
                 } for f in selected],
                 "vlm": judgement,
+                "vlms": vlms,
                 "metrics": metrics,
             })
 
@@ -1541,8 +1825,10 @@ def parse_args(argv=None):
                    help="padding around the ROI, as a fraction of the box")
     p.add_argument("--window-s", type=float, default=float(env("FOREMAN_WINDOW_S", "3.0")),
                    help="rolling evidence window in seconds")
-    p.add_argument("--evidence-frames", type=int, default=int(env("FOREMAN_EVIDENCE_FRAMES", "3")),
+    p.add_argument("--evidence-frames", type=int, default=int(env("FOREMAN_EVIDENCE_FRAMES", "6")),
                    help="representative frames sent to the VLM per inspection")
+    p.add_argument("--capture-s", type=float, default=float(env("FOREMAN_CAPTURE_S", "3.0")),
+                   help="manual 'Inspect now' capture length; sets buffer retention")
     p.add_argument("--jpeg-quality", type=int, default=85)
     p.add_argument("--profile", action="store_true", help="print the backend pipeline")
     args = p.parse_args(argv)
@@ -1568,6 +1854,9 @@ def main(argv=None) -> int:
     load_runtime_dependencies()
 
     LATEST.window_s = args.window_s
+    # Keep enough history for a manual capture, which asks for a longer span
+    # than the rolling window and would otherwise be pruned mid-capture.
+    LATEST.retain_s = max(args.window_s, args.capture_s) + 2.0
     pipeline = Pipeline(args, load_labels(args.labels))
     pipeline.build()
 

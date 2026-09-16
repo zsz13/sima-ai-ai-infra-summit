@@ -15,6 +15,19 @@ dependencies = [
 # provides (pyneat, numpy, cv2). Nothing here is installed on the board.
 
 [dependency-groups]
+# OPTIONAL local development backend (edge/local_edge.py). Not needed for the
+# Modalix path and never installed on the board: `uv sync --group local`.
+# faster-whisper rather than mlx-whisper on purpose - mlx-whisper resolves torch,
+# scipy and numba, while CTranslate2 needs none of them and already brings the
+# onnxruntime the detector uses. See docs/LOCAL_BACKEND.md.
+local = [
+    "onnxruntime>=1.20",    # detector; CoreML execution provider on Apple Silicon
+    "faster-whisper>=1.1",  # ASR via CTranslate2, int8 on CPU
+    "pillow>=11.0",         # JPEG encode/decode for evidence frames
+    "numpy>=2.0",
+    "mlx-vlm>=0.7",         # VLM on Metal; Apple Silicon only
+]
+
 dev = [
     "pytest>=8.3",
     "anyio>=4.6",

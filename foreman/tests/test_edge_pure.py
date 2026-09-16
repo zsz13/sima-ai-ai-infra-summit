@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import struct
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -708,3 +709,224 @@ def test_language_from_script():
     assert fe.language_from_script("There must be no phone.", "ru") == "en"
     assert fe.language_from_script("человек должен держать телефон", "en") == "ru"
     assert fe.language_from_script("123", "ru") == "ru"
+
+
+# --- the judging prompt is shared by both backends ----------------------
+#
+# build_window_prompt was lifted out of GenAI.judge_window so the local backend
+# can send byte-identical instructions. These pin the text: if it drifts, the two
+# backends stop being comparable and the Modalix path has silently changed.
+
+def test_window_prompt_states_the_frame_layout():
+    p = fe.build_window_prompt(3, "The person must be holding a phone.",
+                               "- person: detected in 45/45 frames (100%).")
+    assert "3 still frames captured over about three seconds" in p
+    assert "REQUIREMENT: The person must be holding a phone." in p
+    assert "- person: detected in 45/45 frames (100%)." in p
+    assert '"per_frame":[false,false,false]' in p
+    assert "must have exactly 3 entries" in p
+
+
+def test_window_prompt_describes_roi_crops_separately():
+    p = fe.build_window_prompt(5, "The bottle must have a cap.", "- bottle: 46/46.",
+                               roi_label="bottle", roi_count=2)
+    assert "5 images from about three seconds of video" in p
+    assert "The first 3 show the whole scene" in p
+    assert "2 are close-up crops of the bottle" in p
+
+
+def test_window_prompt_forbids_inventing_objects():
+    """The instruction that exists because the model once claimed a phone that
+    was never there."""
+    p = fe.build_window_prompt(3, "x", "y")
+    assert "Never state that an object is present unless you can actually see it." in p
+    assert "may not claim it is present" in p
+    assert "If the frames disagree with each other, answer UNCLEAR." in p
+
+
+def test_window_prompt_requires_verdict_and_boolean_to_agree():
+    p = fe.build_window_prompt(3, "x", "y")
+    assert 'Set "verdict" to "PASS" only when "meets_requirement" is true' in p
+    assert "The two must agree." in p
+
+
+# --- manual capture window ----------------------------------------------
+#
+# Manual inspection judges what happens AFTER the operator presses the button.
+# Using the rolling buffer instead would judge the seconds before it, which is a
+# different claim entirely.
+
+def test_buffer_retains_longer_than_the_judging_window():
+    """A 4 s manual capture must not be pruned by a 3 s rolling window."""
+    buf = fe.EvidenceBuffer(window_s=3.0, retain_s=6.0)
+    for i in range(90):                       # 6 s at 15 fps
+        buf.add(fe.FrameRecord(i, 1000.0 + i / 15.0, [], None), 1.0)
+    assert len(buf._frames) == 90, "frames inside the retention span were dropped"
+    assert len(buf.window(3.0)) < 90, "the judging window is still 3 s"
+
+
+def test_retention_never_shrinks_below_the_window():
+    buf = fe.EvidenceBuffer(window_s=5.0, retain_s=2.0)
+    assert buf.retain_s == 5.0
+
+
+def test_between_returns_an_explicit_span():
+    buf = fe.EvidenceBuffer(window_s=3.0, retain_s=10.0)
+    for i in range(90):
+        buf.add(fe.FrameRecord(i, 1000.0 + i / 15.0, [], None), 1.0)
+    got = buf.between(1001.0, 1005.0)
+    assert got, "an explicit span returned nothing"
+    assert all(1001.0 <= f.ts <= 1005.0 for f in got)
+    assert got[0].ts >= 1001.0 and got[-1].ts <= 1005.0
+
+
+def test_capture_window_waits_for_new_frames_then_returns_only_those():
+    """The window must start at the call, not before it."""
+    import threading
+
+    buf = fe.EvidenceBuffer(window_s=3.0, retain_s=10.0)
+    now = time.time()
+    # history that must NOT be included
+    for i in range(30):
+        buf.add(fe.FrameRecord(i, now - 2.0 + i / 15.0, [], None), 1.0)
+
+    def feed():
+        for i in range(20):
+            time.sleep(0.02)
+            buf.add(fe.FrameRecord(100 + i, time.time(), [], None), 1.0)
+
+    threading.Thread(target=feed, daemon=True).start()
+    frames, start_ts, end_ts = fe.capture_window(buf, 0.3, timeout_pad=2.0)
+    assert frames, "captured nothing"
+    assert all(f.ts >= start_ts for f in frames), "pre-press frames leaked into the capture"
+    assert all(f.frame_id >= 100 for f in frames), "history was included"
+
+
+def test_capture_window_gives_up_on_a_stalled_camera():
+    """A camera that stops must not hang the request forever."""
+    buf = fe.EvidenceBuffer(window_s=3.0, retain_s=10.0)
+    now = time.time()
+    for i in range(10):
+        buf.add(fe.FrameRecord(i, now - 0.5 + i / 15.0, [], None), 1.0)
+    started = time.monotonic()
+    frames, _s, _e = fe.capture_window(buf, 1.0, timeout_pad=0.3)
+    assert time.monotonic() - started < 3.0, "capture did not time out"
+    assert isinstance(frames, list)
+
+
+# --- the schema example must not be copyable as an answer --------------------
+#
+# Reproduced from audit-local record 66c399dcacfb: with six images the 2B model
+# returned the right structured answer (meets_requirement true, per_frame all
+# true) but copied the prompt's example prose word for word, so a correct PASS
+# arrived carrying the sentence "No phone is visible in any frame." The example
+# was a plausible, self-consistent answer sitting in the prompt; the fix is that
+# it no longer reads like one.
+
+def test_the_prompt_example_and_the_echo_filter_cannot_drift():
+    """Whatever prose the prompt shows, the parser must recognise it coming back.
+
+    An angle-bracket placeholder was tried instead and measured worse: the small
+    model copied the brackets, so every reason became "No reason given." The
+    example stays realistic and the echo is caught here instead, which only works
+    while both sides read the same constant.
+    """
+    p = fe.build_window_prompt(6, "The person must be holding a phone.",
+                               "- cell phone: detected in 45/45 frames (100%).")
+    for s in fe._EXAMPLE_PROSE:
+        assert s in p, f"{s!r} is filtered as an echo but no longer appears in the prompt"
+        assert fe._clean_text(s, "") == "", f"example prose {s!r} survives parsing"
+
+
+def test_an_echoed_schema_example_never_becomes_a_reason():
+    """The exact reply recorded in audit-local/66c399dcacfb.
+
+    The structured answer was right - PASS, every frame supporting - and the
+    three prose fields were the prompt's example, word for word. None of that
+    copied text may reach the operator or the grounding guard.
+    """
+    ev, missing, reason = fe._EXAMPLE_PROSE
+    echoed = ('{"meets_requirement":true,"verdict":"PASS",'
+              '"per_frame":[true,true,true,true,true,true],'
+              f'"evidence":["{ev}"],"missing_evidence":["{missing}"],'
+              f'"reason":"{reason}"}}')
+    out = fe.parse_window_judgement(echoed, 6)
+    assert out["verdict"] == "pass", "the structured answer was usable and must survive"
+    assert out["per_frame"] == [True] * 6
+    for s in fe._EXAMPLE_PROSE:
+        assert s not in out["reason"], f"copied example prose reached the reason: {s!r}"
+        assert s not in out["evidence"], f"copied example prose reached evidence: {s!r}"
+        assert s not in out["missing_evidence"], f"copied example prose survived: {s!r}"
+
+
+def test_a_genuine_sentence_that_resembles_nothing_in_the_prompt_survives():
+    """The filter is verbatim-only; real wording is never touched."""
+    out = fe.parse_window_judgement(
+        '{"meets_requirement":false,"verdict":"FAIL","per_frame":[false],'
+        '"evidence":["the hand is empty"],"missing_evidence":["a phone"],'
+        '"reason":"No phone is visible in the operator\'s hand."}', 1)
+    assert out["reason"] == "No phone is visible in the operator's hand."
+    assert out["evidence"] == ["the hand is empty"]
+
+
+# --- relationship polarity must reach the model ------------------------------
+#
+# "must be holding" and "must NOT be holding" differ only in the value the
+# relationship has to take. If the prompt does not say which, the model is being
+# asked to guess the policy, and a correct observation can still produce the
+# wrong verdict.
+
+def test_a_prompt_without_a_relationship_is_unchanged():
+    """The Modalix path sends this for every presence rule; it must not drift."""
+    plain = fe.build_window_prompt(6, "A person must be visible.", "- person: 45/45.")
+    assert "RELATIONSHIP" not in plain
+    assert "observed_relationship" not in plain
+
+
+def test_a_positive_relationship_states_the_expected_value():
+    p = fe.build_window_prompt(
+        6, "The person must be holding a phone.", "- cell phone: 45/45.",
+        relation="holding", relation_subject="person",
+        relation_object="cell phone", relation_expected=True)
+    assert "holding" in p
+    assert "cell phone" in p
+    assert "observed_relationship" in p
+    assert "holding = true" in p.lower()
+
+
+def test_a_negative_relationship_states_the_opposite_expected_value():
+    p = fe.build_window_prompt(
+        6, "The person must NOT be holding a phone.", "- cell phone: 45/45.",
+        relation="holding", relation_subject="person",
+        relation_object="cell phone", relation_expected=False)
+    assert "holding = false" in p.lower()
+
+
+def test_the_two_polarities_produce_different_prompts():
+    kw = {"relation": "holding", "relation_subject": "person",
+          "relation_object": "cell phone"}
+    pos = fe.build_window_prompt(6, "s", "d", relation_expected=True, **kw)
+    neg = fe.build_window_prompt(6, "s", "d", relation_expected=False, **kw)
+    assert pos != neg, "the model cannot distinguish the rules if the prompt does not"
+
+
+def test_the_prompt_asks_for_an_observation_not_a_policy_decision():
+    p = fe.build_window_prompt(
+        6, "The person must NOT be holding a phone.", "- cell phone: 45/45.",
+        relation="holding", relation_subject="person",
+        relation_object="cell phone", relation_expected=False)
+    low = p.lower()
+    assert "what you observe" in low or "observe" in low
+    assert "not_holding" in low
+
+
+@pytest.mark.parametrize(("raw", "expected"), [
+    ('{"observed_relationship":"holding"}', "holding"),
+    ('{"observed_relationship":"not_holding"}', "not_holding"),
+    ('{"observed_relationship":"NOT_HOLDING"}', "not_holding"),
+    ('{"observed_relationship":"unclear"}', "unclear"),
+    ('{"observed_relationship":"not holding"}', "not_holding"),
+    ('{"verdict":"PASS"}', None),
+])
+def test_the_observed_relationship_is_parsed_back(raw, expected):
+    assert fe.parse_window_judgement(raw, 1)["observed_relationship"] == expected

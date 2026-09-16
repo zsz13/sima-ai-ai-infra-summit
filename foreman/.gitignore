@@ -4,3 +4,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 audit/
+# local-backend runs keep their own trail, never mixed with the Modalix one
+audit-local/
+# local-backend model weights: downloaded, never committed
+models-local/

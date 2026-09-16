@@ -16,21 +16,25 @@
 
 <header class="topbar">
   <div class="topbar-in">
-    <a class="mark" href="#/inspection">Foreman</a>
-    <nav class="nav" aria-label="Views">
-      <a href="#/inspection" id="nav-inspection">Inspection</a>
-      <a href="#/camera" id="nav-camera">Camera Check</a>
-    </nav>
-    <div class="spacer"></div>
-    <div class="speech">
-      <label for="speechlang">Speech</label>
-      <select id="speechlang" title="Language Whisper decodes your spoken standard as">
-        <option value="en">English</option>
-        <option value="ru">Русский</option>
-        <option value="auto">Auto EN/RU</option>
-      </select>
+    <div class="bar-side">
+      <a class="mark" href="#/inspection">Foreman</a>
+      <nav class="nav" aria-label="Views">
+        <a href="#/inspection" id="nav-inspection">Inspection</a>
+        <a href="#/camera" id="nav-camera">Camera Check</a>
+        <a href="#/history" id="nav-history">History</a>
+      </nav>
     </div>
-    <div class="health"><span class="dot" id="dot"></span><span id="health">Connecting</span></div>
+    <div class="bar-side end">
+      <div class="speech">
+        <label for="speechlang">Speech</label>
+        <select id="speechlang" title="Language Whisper decodes your spoken standard as">
+          <option value="en">English</option>
+          <option value="ru">Русский</option>
+          <option value="auto">Auto EN/RU</option>
+        </select>
+      </div>
+      <div class="health"><span class="dot" id="dot"></span><span id="health">Connecting</span></div>
+    </div>
   </div>
 </header>
 
@@ -51,8 +55,20 @@
       <!-- 2. verdict  3. reason  4. measured evidence -->
       <div class="slab" id="slab" aria-live="polite">
         <div class="arming" id="arming"></div>
+        <div class="capture" id="capture" hidden>
+          <div class="capbar"><div class="capfill" id="capfill"></div></div>
+          <ol class="capsteps" id="capsteps">
+            <li data-phase="preparing">Preparing</li>
+            <li data-phase="capturing">Capturing</li>
+            <li data-phase="selecting">Selecting evidence</li>
+            <li data-phase="analyzing">Analyzing</li>
+          </ol>
+        </div>
         <h1 class="verdict small" id="verdict">Waiting for the line</h1>
         <p class="reason quiet" id="reason">Connect the Modalix DevKit, state the standard, then place an item in view.</p>
+        <!-- Per-rule breakdown. Hidden entirely for a single rule, so the
+             one-rule console stays exactly as clean as it was. -->
+        <ol class="rulesresult" id="rulesresult" hidden></ol>
         <div class="metrics" id="metrics"></div>
         <p class="against" id="against"></p>
         <p class="basis" id="basis"></p>
@@ -87,23 +103,82 @@
       </div>
     </section>
 
-    <section class="deck" style="margin-top:var(--gap)">
+    <section class="deck" aria-label="Controls">
       <div class="controls">
+        <div class="modeswitch" role="group" aria-label="Inspection mode">
+          <button class="btn seg" id="mode-manual" type="button" aria-pressed="true">Manual</button>
+          <button class="btn seg" id="mode-auto" type="button" aria-pressed="false">Auto</button>
+        </div>
+        <button class="btn go" id="inspect-now" type="button"
+                title="Capture a few seconds from now, then judge">Inspect now</button>
         <button class="btn rec" id="rec" aria-pressed="false">State the standard</button>
-        <label class="skip" for="typed">Type the standard</label>
-        <input type="text" id="typed" placeholder="Or type it: the person must be holding a phone">
         <button class="btn primary" id="save">Set standard</button>
         <button class="btn" id="clear">Clear session</button>
       </div>
-      <div class="historywrap">
+
+      <!-- One rule by default. The second is opt-in, and two is the maximum. -->
+      <div class="rules" id="rules">
+        <div class="rule" data-rule="1">
+          <label class="rlabel" for="typed">Rule 1</label>
+          <input type="text" id="typed" name="rule1" autocomplete="off"
+                 placeholder="the person must be holding a phone">
+        </div>
+        <div class="rule" data-rule="2" id="rule2row" hidden>
+          <label class="rlabel" for="typed2">Rule 2</label>
+          <input type="text" id="typed2" name="rule2" autocomplete="off"
+                 placeholder="the person must not be holding a bottle">
+          <button class="btn small" id="rule2-remove" type="button">Remove</button>
+        </div>
+        <button class="btn small ghost" id="rule2-add" type="button">+ Add second rule</button>
+      </div>
+      <div class="scoreboard">
         <div class="tally">
           <div class="p"><div class="n" id="n-pass">0</div><div class="l">Passed</div></div>
           <div class="f"><div class="n" id="n-fail">0</div><div class="l">Failed</div></div>
           <div><div class="n" id="n-total">0</div><div class="l">Inspected</div></div>
         </div>
-        <div class="k" id="histk">No verdicts yet</div>
-        <div class="history" id="history"></div>
+        <div class="history" id="history" aria-label="Recent verdicts"></div>
       </div>
+    </section>
+  </div>
+
+  <!-- ===================== HISTORY ===================== -->
+  <div id="view-history" hidden>
+    <section class="panel">
+      <div class="hd">
+        <span><b id="hist-count">0</b> recorded inspections<span id="sel-count" class="selcount" hidden></span></span>
+        <span class="hd-actions">
+          <button class="btn sm" id="sel-all" type="button">Select all</button>
+          <button class="btn sm" id="sel-none" type="button" hidden>Clear selection</button>
+          <span class="hd-sep" aria-hidden="true"></span>
+          <a class="btn sm" id="export-csv" href="/api/export.csv" download>CSV</a>
+          <a class="btn sm" id="export-json" href="/api/export.json" download>JSON</a>
+          <a class="btn sm primary" id="export-zip" href="/api/export.zip" download
+             title="report.csv, report.json and the evidence images in one file">Package</a>
+        </span>
+      </div>
+      <div class="tablewrap">
+        <table class="histtable">
+          <caption class="skip">Recorded inspections, newest first</caption>
+          <thead>
+            <tr>
+              <th scope="col" class="pick"><span class="skip">Select</span></th>
+              <th scope="col">Time</th>
+              <th scope="col">Verdict</th>
+              <th scope="col">Standard</th>
+              <th scope="col">Reason</th>
+              <th scope="col">Detector evidence</th>
+              <th scope="col" class="num">Latency</th>
+            </tr>
+          </thead>
+          <tbody id="hist-body"></tbody>
+        </table>
+      </div>
+      <p class="blank" id="hist-empty">No inspections recorded yet. They appear here as
+        soon as the line produces a verdict.</p>
+      <p class="rawnote">Read straight from the audit trail on this Mac
+        (<code>audit/inspections.jsonl</code>). This view and the export only read it &mdash;
+        nothing here re-runs a model or changes a recorded verdict.</p>
     </section>
   </div>
 
@@ -124,9 +199,20 @@
           <div><div class="v" id="live-win">&mdash;</div><div class="k">frames buffered</div></div>
         </div>
         <div class="classlist" id="classlist"></div>
+        <div class="dbgbar">
+          <label class="dbgtoggle">
+            <input type="checkbox" id="dbg-on">
+            <span>Debug threshold</span>
+          </label>
+          <input type="range" id="dbg-level" min="5" max="55" step="5" value="20" disabled>
+          <output id="dbg-val">20%</output>
+        </div>
         <p class="rawnote">Raw detector output, unfiltered. Mistakes are shown as reported
           &mdash; hiding them would hide what the verdict is actually built on.
-          No inference and no PASS/FAIL record is produced in this view.</p>
+          No inference and no PASS/FAIL record is produced in this view.
+          <span id="dbg-note" hidden><br><b>Debug on.</b> Amber dashed boxes are below the
+          working threshold and are shown for diagnosis only &mdash; they never reach the
+          evidence window, the gate or the PASS/FAIL policy.</span></p>
       </div>
     </section>
     <section class="deck" style="margin-top:var(--gap)">
@@ -141,22 +227,47 @@
 
 <footer class="sitefoot">
   <div class="sitefoot-in">
-    <div>
-      <b>Foreman</b>
-      Made by <a href="https://github.com/zsz13" target="_blank" rel="noopener noreferrer">zsz13</a>
-    </div>
-    <div>
-      <b>Source</b>
-      <a href="https://github.com/zsz13" target="_blank" rel="noopener noreferrer">github.com/zsz13</a>
-    </div>
-    <div>
-      <b>Hardware</b>
-      Built with SiMa.ai Modalix / DevKit 3.0
-    </div>
-    <div>
-      <b>Event</b>
-      Built for the AI Infra Summit Hackathon
-    </div>
+
+    <section class="foot-col">
+      <h2>Built by</h2>
+      <p class="lead">Daniyar Ismailov</p>
+      <p class="sub">XXI Team</p>
+    </section>
+
+    <section class="foot-col">
+      <h2>Source</h2>
+      <p class="lead">
+        <a class="foot-link" href="https://github.com/zsz13/sima-ai-ai-infra-summit"
+           target="_blank" rel="noopener noreferrer">
+          <!-- GitHub "mark-github" Octicon, MIT-licensed, inlined so the footer
+               needs no network request and cannot show a broken image. -->
+          <svg class="ico" viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" focusable="false">
+            <path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.012 8.012 0 0 0 16 8c0-4.42-3.58-8-8-8z"/>
+          </svg>
+          <span>View source</span>
+        </a>
+      </p>
+      <p class="sub repo" title="github.com/zsz13/sima-ai-ai-infra-summit">github.com/zsz13/sima-ai-ai-infra-summit</p>
+    </section>
+
+    <section class="foot-col">
+      <h2>Powered by</h2>
+      <p class="lead">
+        <a class="foot-link" href="https://devkit.sima.ai/collections/mlsoc-development-kit/products/development-kit-3-0"
+           target="_blank" rel="noopener noreferrer">SiMa.ai Modalix / DevKit&nbsp;3.0</a>
+      </p>
+      <p class="sub">Hardware this project runs on</p>
+    </section>
+
+    <section class="foot-col">
+      <h2>Event</h2>
+      <p class="lead">
+        <a class="foot-link" href="https://lablab.ai/ai-hackathons/ai-infra-summit-hackathon/"
+           target="_blank" rel="noopener noreferrer">AI Infra Summit Hackathon</a>
+      </p>
+      <p class="sub">Built during the hackathon</p>
+    </section>
+
   </div>
 </footer>
 
