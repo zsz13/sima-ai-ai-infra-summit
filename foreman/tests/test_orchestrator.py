@@ -59,6 +59,11 @@ def edge_url():
 @pytest.fixture(autouse=True)
 def reset_harness():
     STATE.update({
+        "window_frames": 45,
+        "per_frame": [True, True, True],
+        "vlm_evidence": ["a box is visible"],
+        "vlm_missing": [],
+        "detector_summary": "- box: detected in 45/45 frames (100%).",
         "present": False,
         "bbox": [0.30, 0.30, 0.60, 0.60],
         "verdict": "pass",
@@ -155,8 +160,10 @@ async def test_inspects_once_when_item_settles(edge_url, tmp_path):
         rec = orch.recent[-1]
         assert rec.verdict == "pass"
         assert rec.trigger_label == "box"
-        assert rec.metrics["inference_ms"] == 1234.5
+        assert rec.metrics["inference_ms"] == 3050.0   # temporal multi-image call
         assert "end_to_end_ms" in rec.metrics
+        assert rec.decided_by == "vlm"
+        assert len(rec.evidence_paths) == 3, "three representative frames expected"
     finally:
         await orch.stop()
         await orch.edge.aclose()
@@ -265,6 +272,107 @@ async def test_reports_disconnected_when_edge_is_down(tmp_path):
         assert await _wait_for(lambda: orch.last_error is not None, timeout=5.0)
         assert orch.connected is False
         assert orch.snapshot()["connected"] is False
+    finally:
+        await orch.stop()
+        await orch.edge.aclose()
+
+
+# --- temporal grounding, over the real HTTP contract -------------------
+
+async def test_detector_grounding_overrides_a_hallucinating_vlm(edge_url, tmp_path):
+    """Case 1/7 end to end: the edge's model says PASS, the detector never saw a
+    phone, and the Mac must still refuse to pass it."""
+    STATE["verdict"] = "pass"
+    STATE["reason"] = "The person is clearly holding a smartphone."
+    orch = await _orch(edge_url, tmp_path)
+    orch.set_standard("the person must be holding a smartphone")
+    await orch.start()
+    try:
+        assert await _wait_for(lambda: orch.connected)
+        STATE["present"] = True          # SSE emits "box", never person/cell phone
+        assert await _wait_for(lambda: orch.counters.total >= 1)
+        rec = orch.recent[-1]
+        assert rec.verdict == "fail", "a hallucinated phone must never pass"
+        assert rec.decided_by == "detector-absent"
+        assert any("Detector evidence wins" in n for n in rec.notes)
+    finally:
+        await orch.stop()
+        await orch.edge.aclose()
+
+
+async def test_window_and_frame_metadata_are_recorded(edge_url, tmp_path):
+    orch = await _orch(edge_url, tmp_path)
+    orch.set_standard("the lid must be closed")     # ungrounded -> VLM decides
+    await orch.start()
+    try:
+        assert await _wait_for(lambda: orch.connected)
+        STATE["present"] = True
+        assert await _wait_for(lambda: orch.counters.total >= 1)
+        rec = orch.recent[-1]
+        assert rec.window["total_frames"] == 45
+        assert rec.window["duration_s"] > 0
+        assert len(rec.frames) == 3
+        assert [f["rel_ts"] for f in rec.frames] == sorted(f["rel_ts"] for f in rec.frames)
+        assert all(f["path"] for f in rec.frames)
+        assert rec.vlm["frames_judged"] == 3
+    finally:
+        await orch.stop()
+        await orch.edge.aclose()
+
+
+async def test_contradictory_per_frame_evidence_is_unclear_end_to_end(edge_url, tmp_path):
+    STATE["verdict"] = "pass"
+    STATE["per_frame"] = [True, False, True]
+    orch = await _orch(edge_url, tmp_path)
+    orch.set_standard("the lid must be closed")
+    await orch.start()
+    try:
+        assert await _wait_for(lambda: orch.connected)
+        STATE["present"] = True
+        assert await _wait_for(lambda: orch.counters.total >= 1)
+        assert orch.recent[-1].verdict == "unclear"
+        assert orch.recent[-1].decided_by == "vlm-contradictory"
+    finally:
+        await orch.stop()
+        await orch.edge.aclose()
+
+
+async def test_single_frame_fallback_still_works(edge_url, tmp_path):
+    """FOREMAN_TEMPORAL=0 must keep the previously demonstrated pipeline runnable."""
+    orch = await _orch(edge_url, tmp_path)
+    orch.temporal = False
+    orch.set_standard("the lid must be closed")
+    await orch.start()
+    try:
+        assert await _wait_for(lambda: orch.connected)
+        STATE["present"] = True
+        assert await _wait_for(lambda: orch.counters.total >= 1)
+        rec = orch.recent[-1]
+        assert rec.decided_by == "single-frame-fallback"
+        assert rec.metrics["inference_ms"] == 1234.5
+        assert len(rec.evidence_paths) == 1
+    finally:
+        await orch.stop()
+        await orch.edge.aclose()
+
+
+async def test_audit_record_keeps_the_original_fields(edge_url, tmp_path):
+    """Existing readers of inspections.jsonl must not break."""
+    orch = await _orch(edge_url, tmp_path)
+    orch.set_standard("the lid must be closed")
+    await orch.start()
+    try:
+        assert await _wait_for(lambda: orch.connected)
+        STATE["present"] = True
+        assert await _wait_for(lambda: orch.counters.total >= 1)
+        row = json.loads((tmp_path / "inspections.jsonl").read_text().splitlines()[-1])
+        for key in ("id", "ts", "verdict", "reason", "standard", "trigger_label",
+                    "trigger_confidence", "metrics", "evidence_path"):
+            assert key in row, f"backward-compatible field {key} missing"
+        assert row["evidence_path"].startswith("evidence/")
+        for key in ("decided_by", "evidence_paths", "window", "required_objects",
+                    "prohibited_objects", "vlm", "notes", "frames"):
+            assert key in row, f"temporal field {key} missing"
     finally:
         await orch.stop()
         await orch.edge.aclose()

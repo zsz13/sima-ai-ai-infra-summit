@@ -8,11 +8,17 @@ The wire contract between Mac and DevKit, in one place:
                                          "detections":[{"label","confidence",
                                                         "bbox":[x1,y1,x2,y2],
                                                         "track_id"}]}
-  POST /inspect                 {"standard": str}
-                               -> {"verdict":"pass"|"fail"|"unclear",
-                                   "reason": str, "evidence_jpeg_b64": str,
-                                   "metrics": {"ttft_ms","tokens_per_s",
-                                               "inference_ms"}}
+  POST /inspect                 {"standard", "required_objects", "prohibited_objects",
+                                 "window_s", "num_frames"}
+                               -> {"window": {...}, "detector_summary": str,
+                                   "selected": [{frame_id, ts, rel_ts, sharpness,
+                                                 detections, jpeg_b64}],
+                                   "vlm": {verdict, per_frame, evidence,
+                                           missing_evidence, reason},
+                                   "metrics": {...}}
+                                  Returns evidence, NOT a final verdict: the
+                                  grounding policy runs on the Mac.
+  POST /inspect_single          {"standard"}  -> single-frame fallback, see above
   POST /transcribe              multipart audio
                                -> {"text": str, "language": str,
                                    "no_speech_prob": float,
@@ -24,6 +30,7 @@ Modalix MLA; this module only moves bytes.
 
 from __future__ import annotations
 
+import base64
 import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -42,6 +49,32 @@ class Frame:
     frame_id: int
     ts: float
     detections: list[Detection]
+
+
+@dataclass(frozen=True)
+class SelectedFrame:
+    """One representative frame the edge chose from the evidence window."""
+    frame_id: int
+    ts: float
+    rel_ts: float
+    sharpness: float
+    detections: list[Detection]
+    jpeg: bytes
+
+
+@dataclass(frozen=True)
+class WindowEvidence:
+    """Raw evidence for one inspection. Deliberately carries NO final verdict -
+    the grounding policy that can override the model runs on the Mac."""
+    start_ts: float
+    end_ts: float
+    duration_s: float
+    total_frames: int
+    image_frames: int
+    detector_summary: str
+    selected: list[SelectedFrame]
+    vlm: dict
+    metrics: dict
 
 
 @dataclass(frozen=True)
@@ -125,12 +158,13 @@ class EdgeClient:
             raise EdgeError(f"edge event stream failed: {exc}") from exc
 
     async def inspect(self, standard: str) -> Verdict:
-        """Ask the DevKit to judge the current frame against `standard`.
+        """Single-frame judgement - the pre-temporal fallback path.
 
-        This is the VLM call. It runs on the MLA and takes seconds.
+        Used only when the orchestrator runs with FOREMAN_TEMPORAL=0. It has no
+        temporal evidence and no detector grounding.
         """
         try:
-            r = await self._client.post("/inspect", json={"standard": standard})
+            r = await self._client.post("/inspect_single", json={"standard": standard})
             r.raise_for_status()
             obj = r.json()
         except httpx.HTTPError as exc:
@@ -145,6 +179,63 @@ class EdgeClient:
             verdict=verdict,
             reason=str(obj.get("reason", "")),
             evidence_jpeg_b64=obj.get("evidence_jpeg_b64"),
+            metrics={k: float(v) for k, v in (obj.get("metrics") or {}).items()},
+        )
+
+    async def inspect_window(
+        self,
+        standard: str,
+        required: list[str],
+        prohibited: list[str],
+        window_s: float,
+        num_frames: int,
+    ) -> WindowEvidence:
+        """Ask the DevKit to judge a rolling evidence window.
+
+        One multi-image VLM call on the MLA; takes a few seconds.
+        """
+        try:
+            r = await self._client.post("/inspect", json={
+                "standard": standard,
+                "required_objects": required,
+                "prohibited_objects": prohibited,
+                "window_s": window_s,
+                "num_frames": num_frames,
+            })
+            r.raise_for_status()
+            obj = r.json()
+        except httpx.HTTPError as exc:
+            raise EdgeError(f"inspect failed: {exc}") from exc
+        except ValueError as exc:
+            raise EdgeError(f"inspect returned invalid JSON: {exc}") from exc
+
+        window = obj.get("window") or {}
+        selected: list[SelectedFrame] = []
+        for item in obj.get("selected") or []:
+            try:
+                jpeg = base64.b64decode(item.get("jpeg_b64") or "", validate=True)
+            except (ValueError, TypeError):
+                continue
+            selected.append(SelectedFrame(
+                frame_id=int(item.get("frame_id", 0)),
+                ts=float(item.get("ts", 0.0)),
+                rel_ts=float(item.get("rel_ts", 0.0)),
+                sharpness=float(item.get("sharpness", 0.0)),
+                detections=[_parse_detection(d) for d in item.get("detections", [])],
+                jpeg=jpeg,
+            ))
+        if not selected:
+            raise EdgeError("edge returned no usable evidence frames")
+
+        return WindowEvidence(
+            start_ts=float(window.get("start_ts", 0.0)),
+            end_ts=float(window.get("end_ts", 0.0)),
+            duration_s=float(window.get("duration_s", 0.0)),
+            total_frames=int(window.get("total_frames", 0)),
+            image_frames=int(window.get("image_frames", 0)),
+            detector_summary=str(obj.get("detector_summary", "")),
+            selected=selected,
+            vlm=obj.get("vlm") or {},
             metrics={k: float(v) for k, v in (obj.get("metrics") or {}).items()},
         )
 

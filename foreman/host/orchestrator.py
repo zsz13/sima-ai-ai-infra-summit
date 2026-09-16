@@ -23,6 +23,8 @@ from pathlib import Path
 
 from .edge_client import EdgeClient, EdgeError, Frame, Verdict
 from .gate import Gate, GateConfig
+from .policy import GroundingConfig, VlmJudgement, build_evidence, decide
+from .standard_parser import parse_standard
 
 MAX_RECENT = 40
 RECONNECT_BACKOFF = (1.0, 2.0, 4.0, 8.0, 15.0)
@@ -30,6 +32,12 @@ RECONNECT_BACKOFF = (1.0, 2.0, 4.0, 8.0, 15.0)
 
 @dataclass
 class Inspection:
+    """One inspection result.
+
+    The first nine fields are unchanged from the single-frame version so existing
+    audit files and readers stay valid; everything temporal is additive.
+    """
+
     id: str
     ts: float
     verdict: str
@@ -38,7 +46,17 @@ class Inspection:
     trigger_label: str | None
     trigger_confidence: float | None
     metrics: dict[str, float]
-    evidence_path: str | None = None
+    evidence_path: str | None = None          # first frame, for backward compatibility
+
+    # --- temporal grounding ---
+    decided_by: str = ""
+    evidence_paths: list[str] = field(default_factory=list)
+    window: dict = field(default_factory=dict)
+    required_objects: list[dict] = field(default_factory=list)
+    prohibited_objects: list[dict] = field(default_factory=list)
+    vlm: dict = field(default_factory=dict)
+    notes: list[str] = field(default_factory=list)
+    frames: list[dict] = field(default_factory=list)
 
     def public(self) -> dict:
         return asdict(self)
@@ -66,6 +84,7 @@ class Orchestrator:
     connected: bool = False
     last_error: str | None = None
     frames_seen: int = 0
+    warming_up: bool = False
     detections_last_frame: int = 0
     fps: float = 0.0
     inspecting: bool = False
@@ -73,7 +92,16 @@ class Orchestrator:
     counters: Counters = field(default_factory=Counters)
     recent: deque[Inspection] = field(default_factory=lambda: deque(maxlen=MAX_RECENT))
 
+    temporal: bool = True
+    window_s: float = 3.0
+    evidence_frames: int = 3
+    grounding: GroundingConfig = field(default_factory=GroundingConfig)
+
     _gate: Gate = field(init=False)
+    #: (ts, detections) for every frame received, trimmed to the window. This is
+    #: the Mac's own copy of the temporal evidence, so aggregation and policy are
+    #: testable without hardware.
+    _ring: deque = field(default_factory=lambda: deque(maxlen=600), init=False)
     _task: asyncio.Task | None = field(default=None, init=False)
     _subscribers: set[asyncio.Queue] = field(default_factory=set, init=False)
     _fps_window: deque[float] = field(default_factory=lambda: deque(maxlen=30), init=False)
@@ -127,9 +155,14 @@ class Orchestrator:
             "gate_state": self._gate.state.value,
             "gate_progress": round(self._gate.progress, 3),
             "inspecting": self.inspecting,
+            "warming_up": self.warming_up,
+            "window_frames": sum(1 for ts, _ in self._ring
+                                 if self._ring and ts >= self._ring[-1][0] - self.window_s),
             "frames_seen": self.frames_seen,
             "detections_last_frame": self.detections_last_frame,
             "fps": round(self.fps, 1),
+            "temporal": self.temporal,
+            "window_s": self.window_s,
             "counters": asdict(self.counters) | {"total": self.counters.total},
             "recent": [i.public() for i in reversed(self.recent)],
         }
@@ -147,6 +180,11 @@ class Orchestrator:
         self.recent.clear()
         self._gate.reset()
         self._publish()
+
+    def reset(self) -> None:
+        """Drop buffered evidence too, e.g. when the camera source changes."""
+        self._ring.clear()
+        self.clear_session()
 
     # --- main loop ------------------------------------------------------
 
@@ -178,8 +216,26 @@ class Orchestrator:
             attempt += 1
             await asyncio.sleep(delay)
 
+    def _window_ready(self) -> bool:
+        """Enough buffered frames in the last `window_s` to judge anything."""
+        if not self._ring:
+            return False
+        newest = self._ring[-1][0]
+        recent = sum(1 for ts, _ in self._ring if ts >= newest - self.window_s)
+        return recent >= self.grounding.min_window_frames
+
+    def _detections_between(self, start_ts: float, end_ts: float) -> list[list[dict]]:
+        """This Mac's detections for exactly the window the edge reported, so both
+        sides aggregate the same frames."""
+        pad = 0.05  # tolerate clock skew between the two hosts
+        return [dets for ts, dets in list(self._ring)
+                if start_ts - pad <= ts <= end_ts + pad]
+
     async def _on_frame(self, frame: Frame) -> None:
         self.frames_seen += 1
+        self._ring.append((frame.ts, [
+            {"label": d.label, "confidence": d.confidence, "bbox": list(d.bbox)}
+            for d in frame.detections]))
         self.detections_last_frame = len(frame.detections)
         self._fps_window.append(time.monotonic())
         if len(self._fps_window) >= 2:
@@ -189,18 +245,33 @@ class Orchestrator:
         should_inspect = self._gate.update(frame.detections)
 
         if should_inspect and self.standard and not self.inspecting:
+            if self.temporal and not self._window_ready():
+                # The gate settled before the evidence window had filled - which
+                # happens on the first item after connecting or after a new
+                # standard. Re-arm instead of consuming the item, so it is judged
+                # on a full window a moment later rather than refused for lack of
+                # evidence.
+                self._gate.reset()
+                self.warming_up = True
+                self._publish()
+                return
+            self.warming_up = False
             asyncio.create_task(self._inspect())
         else:
+            self.warming_up = self.temporal and not self._window_ready()
             self._publish()
 
     async def _inspect(self) -> None:
-        """Run one VLM judgement on the DevKit and record the result."""
+        """Judge one item. Temporal by default; single-frame only as a fallback."""
         self.inspecting = True
         self._publish()
         trigger = self._gate.last_trigger
         started = time.monotonic()
         try:
-            verdict: Verdict = await self.edge.inspect(self.standard)
+            if self.temporal:
+                record = await self._inspect_temporal(trigger, started)
+            else:
+                record = await self._inspect_single_frame(trigger, started)
         except EdgeError as exc:
             self.counters.errors += 1
             self.last_error = str(exc)
@@ -208,27 +279,9 @@ class Orchestrator:
             self._publish()
             return
 
-        elapsed_ms = (time.monotonic() - started) * 1000.0
-        metrics = dict(verdict.metrics)
-        # Reported separately and honestly: the model's own inference time comes
-        # from the edge; this is the full round trip measured on the Mac.
-        metrics["end_to_end_ms"] = round(elapsed_ms, 1)
-
-        record = Inspection(
-            id=uuid.uuid4().hex[:12],
-            ts=time.time(),
-            verdict=verdict.verdict,
-            reason=verdict.reason,
-            standard=self.standard,
-            trigger_label=trigger.label if trigger else None,
-            trigger_confidence=trigger.confidence if trigger else None,
-            metrics=metrics,
-            evidence_path=self._save_evidence(verdict.evidence_jpeg_b64),
-        )
-
-        if verdict.verdict == "pass":
+        if record.verdict == "pass":
             self.counters.passed += 1
-        elif verdict.verdict == "fail":
+        elif record.verdict == "fail":
             self.counters.failed += 1
         else:
             self.counters.unclear += 1
@@ -238,16 +291,113 @@ class Orchestrator:
         self.inspecting = False
         self._publish()
 
+    async def _inspect_temporal(self, trigger, started: float) -> Inspection:
+        """Detector evidence across the window decides what the VLM is allowed to say."""
+        parsed = parse_standard(self.standard)
+        evidence = await self.edge.inspect_window(
+            self.standard, list(parsed.required), list(parsed.prohibited),
+            self.window_s, self.evidence_frames)
+
+        frames = self._detections_between(evidence.start_ts, evidence.end_ts)
+        if not frames:
+            # The edge counted frames we never received; fall back to its count so
+            # the window-length check still means something.
+            frames = [[]] * evidence.total_frames
+
+        detector = build_evidence(
+            frames, [*parsed.required, *parsed.prohibited], self.grounding)
+
+        vlm_raw = evidence.vlm or {}
+        judgement = VlmJudgement(
+            verdict=str(vlm_raw.get("verdict", "unclear")).lower(),
+            reason=str(vlm_raw.get("reason", "")),
+            evidence=tuple(vlm_raw.get("evidence") or ()),
+            missing_evidence=tuple(vlm_raw.get("missing_evidence") or ()),
+            per_frame=tuple(vlm_raw.get("per_frame") or ()),
+        )
+        decision = decide(parsed, detector, judgement, self.grounding)
+
+        paths = [p for p in (self._save_evidence_bytes(f.jpeg) for f in evidence.selected) if p]
+        elapsed_ms = (time.monotonic() - started) * 1000.0
+        metrics = dict(evidence.metrics)
+        metrics["end_to_end_ms"] = round(elapsed_ms, 1)
+        metrics["host_ms"] = round(elapsed_ms - metrics.get("inference_ms", 0.0), 1)
+
+        return Inspection(
+            id=uuid.uuid4().hex[:12],
+            ts=time.time(),
+            verdict=decision.verdict,
+            reason=decision.reason,
+            standard=self.standard,
+            trigger_label=trigger.label if trigger else None,
+            trigger_confidence=trigger.confidence if trigger else None,
+            metrics=metrics,
+            evidence_path=paths[0] if paths else None,
+            decided_by=decision.decided_by,
+            evidence_paths=paths,
+            window={
+                "start_ts": evidence.start_ts,
+                "end_ts": evidence.end_ts,
+                "duration_s": evidence.duration_s,
+                "total_frames": evidence.total_frames,
+                "image_frames": evidence.image_frames,
+                "frames_aggregated": len(frames),
+                "detector_summary": evidence.detector_summary,
+            },
+            required_objects=decision.required,
+            prohibited_objects=decision.prohibited,
+            vlm=decision.vlm,
+            notes=decision.notes,
+            frames=[{
+                "path": path,
+                "frame_id": f.frame_id,
+                "rel_ts": f.rel_ts,
+                "sharpness": f.sharpness,
+                "detections": [{"label": d.label, "confidence": round(d.confidence, 3),
+                                "bbox": [round(v, 4) for v in d.bbox]}
+                               for d in f.detections],
+            } for f, path in zip(evidence.selected, paths, strict=False)],
+        )
+
+    async def _inspect_single_frame(self, trigger, started: float) -> Inspection:
+        """Pre-temporal path: one frame, no detector grounding. FOREMAN_TEMPORAL=0."""
+        verdict: Verdict = await self.edge.inspect(self.standard)
+        elapsed_ms = (time.monotonic() - started) * 1000.0
+        metrics = dict(verdict.metrics)
+        metrics["end_to_end_ms"] = round(elapsed_ms, 1)
+        path = self._save_evidence(verdict.evidence_jpeg_b64)
+        return Inspection(
+            id=uuid.uuid4().hex[:12],
+            ts=time.time(),
+            verdict=verdict.verdict,
+            reason=verdict.reason,
+            standard=self.standard,
+            trigger_label=trigger.label if trigger else None,
+            trigger_confidence=trigger.confidence if trigger else None,
+            metrics=metrics,
+            evidence_path=path,
+            decided_by="single-frame-fallback",
+            evidence_paths=[path] if path else [],
+            notes=["Single-frame fallback: no temporal evidence, no detector grounding."],
+        )
+
     # --- persistence ----------------------------------------------------
 
     def _save_evidence(self, b64: str | None) -> str | None:
         if not b64:
             return None
         try:
-            raw = base64.b64decode(b64, validate=True)
+            return self._save_evidence_bytes(base64.b64decode(b64, validate=True))
         except (ValueError, TypeError):
             return None
-        name = f"{int(time.time() * 1000)}.jpg"
+
+    _evidence_seq: int = 0
+
+    def _save_evidence_bytes(self, raw: bytes | None) -> str | None:
+        if not raw:
+            return None
+        self._evidence_seq += 1
+        name = f"{int(time.time() * 1000)}-{self._evidence_seq}.jpg"
         (self.audit_dir / "evidence" / name).write_bytes(raw)
         return f"evidence/{name}"
 

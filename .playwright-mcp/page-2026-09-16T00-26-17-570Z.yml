@@ -1,0 +1,94 @@
+- generic [ref=f4e2]:
+  - banner [ref=f4e3]:
+    - generic [ref=f4e4]: Foreman
+    - generic [ref=f4e5]:
+      - generic [ref=f4e6]: Inspecting against
+      - generic [ref=f4e7]: A person must be visible in the frame
+    - link "Live camera view" [ref=f4e8] [cursor=pointer]:
+      - /url: https://127.0.0.1:8081/static/viewer.html?src=0
+    - generic [ref=f4e9]: Modalix connected
+    - generic [ref=f4e12]:
+      - generic [ref=f4e13]:
+        - generic [ref=f4e14]: "3"
+        - generic [ref=f4e15]: Passed
+      - generic [ref=f4e16]:
+        - generic [ref=f4e17]: "2"
+        - generic [ref=f4e18]: Failed
+      - generic [ref=f4e19]:
+        - generic [ref=f4e20]: "5"
+        - generic [ref=f4e21]: Inspected
+  - main [ref=f4e22]:
+    - generic [ref=f4e23]:
+      - heading "pass" [level=1] [ref=f4e24]
+      - paragraph [ref=f4e25]: A person is visible in all three frames, with the same subject matter.
+      - generic [ref=f4e26]:
+        - generic [ref=f4e27]:
+          - generic [ref=f4e28]: 100%
+          - generic [ref=f4e29]: person present
+          - generic [ref=f4e30]: 46 / 46 frames
+        - generic [ref=f4e31]:
+          - generic [ref=f4e32]: 69%
+          - generic [ref=f4e33]: detector confidence
+          - generic [ref=f4e34]: median over the window
+        - generic [ref=f4e35]:
+          - generic [ref=f4e36]: 3 / 3
+          - generic [ref=f4e37]: frames in agreement
+          - generic [ref=f4e38]: across the evidence window
+        - generic [ref=f4e39]:
+          - generic [ref=f4e40]: "46"
+          - generic [ref=f4e41]: frames of evidence
+          - generic [ref=f4e42]: 3.0 s window
+      - paragraph [ref=f4e43]: Judged against A person must be visible in the frame
+      - paragraph [ref=f4e44]: Detector grounding was satisfied, so the language model judged the relationship. Detector confirmed every required object across the window; the relationship was judged by the vision-language model.
+    - generic [ref=f4e45]:
+      - generic [ref=f4e46]:
+        - generic [ref=f4e47]:
+          - generic [ref=f4e48]: 3 evidence frames
+          - generic [ref=f4e49]: 5:25:52 PM
+        - generic [ref=f4e50]:
+          - generic [ref=f4e51]:
+            - img "Evidence frame judged by the model" [ref=f4e52]
+            - generic:
+              - generic: person 69%
+              - generic: person 61%
+              - generic: person 57%
+            - generic [ref=f4e53]: +0.2 s
+          - generic [ref=f4e54]:
+            - img "Evidence frame judged by the model" [ref=f4e55]
+            - generic:
+              - generic: person 69%
+              - generic: person 61%
+            - generic [ref=f4e56]: +1.9 s
+          - generic [ref=f4e57]:
+            - img "Evidence frame judged by the model" [ref=f4e58]
+            - generic:
+              - generic: person 69%
+              - generic: person 57%
+            - generic [ref=f4e59]: +2.3 s
+      - generic [ref=f4e60]:
+        - generic [ref=f4e61]:
+          - generic [ref=f4e62]: See
+          - generic [ref=f4e63]: 15 fps
+          - generic [ref=f4e64]: Detector on Modalix MLA
+        - generic [ref=f4e65]:
+          - generic [ref=f4e66]: Understand
+          - generic [ref=f4e67]: 2.29 s
+          - generic [ref=f4e68]: Vision-language model on MLA
+        - generic [ref=f4e69]:
+          - generic [ref=f4e70]: Act
+          - generic [ref=f4e71]: 2.32 s
+          - generic [ref=f4e72]: Verdict logged on this Mac
+  - contentinfo [ref=f4e73]:
+    - generic [ref=f4e74]:
+      - button "State the standard" [ref=f4e75] [cursor=pointer]
+      - 'textbox "Or type it: every box must have a label facing up" [ref=f4e76]'
+      - button "Set standard" [ref=f4e77] [cursor=pointer]
+      - button "Clear session" [ref=f4e78] [cursor=pointer]
+    - generic [ref=f4e79]:
+      - generic [ref=f4e80]: Recent verdicts, newest first
+      - generic [ref=f4e81]:
+        - 'generic "pass: A person is visible in all three frames, with the same subject matter." [ref=f4e82]'
+        - 'generic "pass: Person is not holding a phone in all frames, as confirmed by the detector evidence." [ref=f4e83]'
+        - 'generic "pass: <one short sentence>" [ref=f4e84]'
+        - 'generic "fail: No bottle was found during the inspection window: never detected. The requirement cannot be met." [ref=f4e85]'
+        - 'generic "fail: No cell phone was found during the inspection window: never detected. The requirement cannot be met." [ref=f4e86]'

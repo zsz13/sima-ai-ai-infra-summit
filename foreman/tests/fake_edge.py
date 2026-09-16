@@ -63,6 +63,11 @@ STATE = {
     "inspect_delay": 0.05,
     "inspect_calls": 0,
     "fps": 30.0,
+    "window_frames": 45,
+    "per_frame": [True, True, True],
+    "vlm_evidence": ["a box is visible"],
+    "vlm_missing": [],
+    "detector_summary": "- box: detected in 45/45 frames (100%).",
 }
 
 
@@ -94,6 +99,46 @@ async def events() -> StreamingResponse:
 
 @app.post("/inspect")
 async def inspect(body: dict) -> dict:
+    """Temporal window contract. Mirrors the real edge's response shape."""
+    STATE["inspect_calls"] += 1
+    await asyncio.sleep(STATE["inspect_delay"])
+    now = time.time()
+    window_s = float(body.get("window_s") or 3.0)
+    want = int(body.get("num_frames") or 3)
+    total = int(STATE["window_frames"])
+    start = now - window_s
+
+    selected = [{
+        "frame_id": 1000 + i,
+        "ts": start + (i + 0.5) * window_s / max(want, 1),
+        "rel_ts": round((i + 0.5) * window_s / max(want, 1), 3),
+        "sharpness": 120.0 - i,
+        "detections": ([{"label": "box", "confidence": 0.93,
+                         "bbox": list(STATE["bbox"]), "track_id": 1}]
+                       if STATE["present"] else []),
+        "jpeg_b64": TINY_JPEG_B64,
+    } for i in range(want)]
+
+    return {
+        "window": {"start_ts": start, "end_ts": now, "duration_s": window_s,
+                   "total_frames": total, "image_frames": max(want, total // 3)},
+        "detector_summary": STATE["detector_summary"],
+        "selected": selected,
+        "vlm": {
+            "verdict": STATE["verdict"],
+            "reason": STATE["reason"],
+            "evidence": list(STATE["vlm_evidence"]),
+            "missing_evidence": list(STATE["vlm_missing"]),
+            "per_frame": list(STATE["per_frame"])[:want] or [None] * want,
+        },
+        "metrics": {"inference_ms": 3050.0, "ttft_ms": 260.0,
+                    "vlm_calls": 1, "frames_sent": want, "selection_ms": 1.2},
+    }
+
+
+@app.post("/inspect_single")
+async def inspect_single(body: dict) -> dict:
+    """Pre-temporal single-frame contract, kept for the fallback path."""
     STATE["inspect_calls"] += 1
     await asyncio.sleep(STATE["inspect_delay"])
     return {

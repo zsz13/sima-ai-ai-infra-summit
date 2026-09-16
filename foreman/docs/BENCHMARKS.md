@@ -7,6 +7,14 @@ SiMa.ai's published figures for Modalix (50 TOPS, under 10 W) are claims about
 the chip from vendor material. They are not measurements of this application and
 are not reported as such anywhere in this project.
 
+> **Two pipeline generations are reported below.** Sections 1-7 are the original
+> **single-frame** pipeline, kept verbatim as historical measurements. Section 8
+> is the **temporal grounding** pipeline that replaced it. They are not
+> interchangeable: the temporal pipeline sends three frames per judgement instead
+> of one, so its latency and its effect on detector throughput are different by
+> design. Do not compare a number from section 3 with one from section 8 without
+> saying which pipeline it came from.
+
 ## Setup under test
 
 | | |
@@ -247,6 +255,59 @@ detector running on live video:
 | `lm96163` temp1 / temp2 | 55 C / 57 C |
 
 Load average 3.49 across 16 cores. Passive, with the DevKit's stock cooling.
+
+## 8. Temporal grounding (current pipeline)
+
+Measured after the change from single-frame to a 3-second rolling evidence
+window. Same DevKit, same detector, same VLM; the camera is 15 fps nominal.
+
+### Cost
+
+| | Single-frame (historical) | **Temporal (current)** |
+|---|---|---|
+| Frames judged per inspection | 1 | **3**, spread over a 3 s window |
+| VLM calls per inspection | 1 | **1** (multi-image, verified supported) |
+| VLM latency, median | 1368 ms (n=31) | **2133 ms** (n=10, min 1818, max 2404) |
+| Detector fps, idle | 15.1 | **16.7** (n=25) |
+| Detector fps, under load | 15.2 (-0.7%) | **15.2 (-9.0%)** (n=25) |
+| Frame selection | n/a | **0.3 ms** (n=10) |
+| Host overhead per inspection | ~12 ms | **19.5 ms** median |
+| Evidence buffer | none | **46 frames, 16 images, 0.97 MB** |
+
+**1.56x the VLM latency for 3x the evidence**, because one multi-image request is
+used rather than three separate calls.
+
+The **-9.0% detector throughput under load is a real cost**, and larger than the
+-0.7% the single-frame pipeline showed - the multi-image request does more MLA
+work. The detector is still camera-bound at 15 fps with roughly 10x headroom, so
+the live view is unaffected; this figure would matter at saturation.
+
+### Multi-image support
+
+Verified on this hardware before designing around it: three images in one
+OpenAI-compatible request are received and described **individually and in order**
+(`{"count": 3}`, correct word and colour per image) in **3059 ms**. A contact
+sheet and N separate calls were therefore not needed.
+
+### Temporal grounding thresholds
+
+`host/policy.py` defaults, chosen from measurements on this board rather than guessed:
+
+| Threshold | Default | Why |
+|---|---|---|
+| `min_confidence` | 0.55 | INT8 detector scores land on a coarse grid topping out at ~0.69; 0.50-0.52 is the noise band (section "Findings"). |
+| `absent_ratio_max` | 0.10 | An object genuinely held in frame for 3 s is detected far more often than 10% of frames. Measured: a present person scores 100% (49/49); a phone that is truly absent scores 0%. |
+| `present_ratio_min` | 0.60 | Leaves room for occlusion and motion blur. Measured intermediate case: a phone at the edge of visibility scored 11% (5/45), which lands in the UNCLEAR band, not PASS. |
+| `min_window_frames` | 10 | Below this the window cannot support a judgement; the orchestrator re-arms the gate rather than judging. |
+
+### Observed detector behaviour used to set them
+
+| Scene | Class | Presence |
+|---|---|---|
+| Person at a desk, no phone | `person` | **49/49 (100%)**, median confidence 0.69 |
+| Person at a desk, no phone | `cell phone` | **0/49 (0%)** |
+| Person at a desk, no bottle | `bottle` | **0/49 (0%)** |
+| Person, phone at the edge of visibility | `cell phone` | **5/45 (11%)** -> UNCLEAR band |
 
 ## Not yet measured
 

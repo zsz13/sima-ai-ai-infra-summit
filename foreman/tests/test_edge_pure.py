@@ -198,3 +198,144 @@ def test_fenced_dual_field_reply():
     reply = ('```json\n{"meets_requirement": false, "verdict": "fail", '
              '"reason": "There is no dog."}\n```')
     assert fe.parse_verdict(reply) == ("fail", "There is no dog.")
+
+
+# --- multi-frame window judgement ------------------------------------
+
+def test_window_judgement_parses_a_clean_reply():
+    reply = ('{"meets_requirement":false,"verdict":"FAIL",'
+             '"per_frame":[false,false,null],'
+             '"evidence":["hands are empty"],"missing_evidence":["any phone"],'
+             '"reason":"No phone is visible."}')
+    j = fe.parse_window_judgement(reply, 3)
+    assert j["verdict"] == "fail"
+    assert j["per_frame"] == [False, False, None]
+    assert j["evidence"] == ["hands are empty"]
+    assert j["missing_evidence"] == ["any phone"]
+
+
+def test_window_judgement_contradiction_becomes_unclear():
+    """Observed on hardware: verdict PASS with a reason saying the opposite."""
+    reply = ('{"meets_requirement":false,"verdict":"PASS","per_frame":[null,null,null],'
+             '"reason":"The person is not holding a smartphone in any of the frames."}')
+    j = fe.parse_window_judgement(reply, 3)
+    assert j["verdict"] == "unclear"
+    assert "contradicted itself" in j["reason"]
+
+
+def test_window_judgement_accepts_per_frame_dicts_too():
+    reply = ('{"verdict":"PASS","per_frame":[{"index":1,"supports":true},'
+             '{"index":2,"supports":false}],"reason":"Mixed."}')
+    assert fe.parse_window_judgement(reply, 3)["per_frame"] == [True, False, None]
+
+
+def test_window_judgement_pads_per_frame_to_the_number_sent():
+    j = fe.parse_window_judgement('{"verdict":"PASS","per_frame":[true],"reason":"x"}', 3)
+    assert len(j["per_frame"]) == 3
+
+
+def test_window_judgement_truncates_extra_per_frame_entries():
+    j = fe.parse_window_judgement(
+        '{"verdict":"PASS","per_frame":[true,true,true,true,true],"reason":"x"}', 3)
+    assert len(j["per_frame"]) == 3
+
+
+def test_window_judgement_unparseable_is_unclear_not_a_guess():
+    j = fe.parse_window_judgement("I believe the phone is there somewhere", 3)
+    assert j["verdict"] == "unclear"
+    assert "did not return usable JSON" in j["reason"]
+    assert j["per_frame"] == [None, None, None]
+
+
+def test_window_judgement_handles_a_fenced_reply():
+    reply = '```json\n{"meets_requirement":true,"verdict":"PASS","per_frame":[true,true,true],"reason":"Held."}\n```'
+    assert fe.parse_window_judgement(reply, 3)["verdict"] == "pass"
+
+
+def test_window_judgement_caps_list_lengths():
+    reply = ('{"verdict":"PASS","per_frame":[true,true,true],'
+             '"evidence":["a","b","c","d","e","f","g","h"],"reason":"x"}')
+    assert len(fe.parse_window_judgement(reply, 3)["evidence"]) <= 6
+
+
+def test_schema_placeholder_reason_is_rejected():
+    """Observed on hardware: the model echoed the prompt's own placeholder."""
+    reply = '{"meets_requirement":true,"verdict":"PASS","per_frame":[true,true,true],"reason":"<one short sentence>"}'
+    j = fe.parse_window_judgement(reply, 3)
+    assert j["verdict"] == "pass"
+    assert j["reason"] == "No reason given."
+
+
+def test_placeholder_evidence_items_are_dropped():
+    reply = ('{"verdict":"PASS","per_frame":[true,true,true],'
+             '"evidence":["<short visible fact>","a real observation"],"reason":"ok"}')
+    assert fe.parse_window_judgement(reply, 3)["evidence"] == ["a real observation"]
+
+
+def test_duplicate_evidence_items_are_collapsed():
+    reply = ('{"verdict":"PASS","per_frame":[true,true,true],'
+             '"evidence":["person visible","person visible","person visible"],"reason":"ok"}')
+    assert fe.parse_window_judgement(reply, 3)["evidence"] == ["person visible"]
+
+
+# --- representative frame selection -----------------------------------
+
+class _Rec:
+    def __init__(self, ts, sharpness=100.0, detections=None, jpeg=b"x", frame_id=0):
+        self.ts, self.sharpness = ts, sharpness
+        self.detections = detections or []
+        self.jpeg, self.frame_id = jpeg, frame_id
+
+
+def _window(n=45, fps=15.0, sharp=lambda i: 100.0, dets=lambda i: None):
+    return [_Rec(ts=i / fps, sharpness=sharp(i), detections=dets(i), frame_id=i)
+            for i in range(n) if i % 3 == 0]
+
+
+def test_selection_returns_the_requested_number():
+    assert len(fe.select_representative(_window(), [], 3)) == 3
+
+
+def test_selected_frames_are_temporally_separated():
+    """Regression: +0.9 s and +1.0 s were chosen together from adjacent buckets."""
+    chosen = fe.select_representative(_window(), [], 3)
+    times = [c.ts for c in chosen]
+    gaps = [b - a for a, b in zip(times, times[1:], strict=False)]
+    assert all(g >= 0.5 for g in gaps), f"frames too close together: {times}"
+
+
+def test_selected_frames_are_returned_in_time_order():
+    chosen = fe.select_representative(_window(), [], 3)
+    assert [c.ts for c in chosen] == sorted(c.ts for c in chosen)
+
+
+def test_selection_prefers_frames_showing_the_required_object():
+    def dets(i):
+        return [{"label": "cell phone", "confidence": 0.66}] if i >= 30 else []
+    chosen = fe.select_representative(_window(dets=dets), ["cell phone"], 2)
+    assert any(c.detections for c in chosen), "a frame with the object should be chosen"
+
+
+def test_selection_prefers_sharper_frames_when_all_else_is_equal():
+    frames = _window(sharp=lambda i: float(i))
+    sharpest = max(f.sharpness for f in frames)
+    chosen = fe.select_representative(frames, [], 1)
+    assert chosen[0].sharpness == sharpest
+
+
+def test_selection_skips_frames_with_no_jpeg():
+    frames = [_Rec(ts=i / 15.0, jpeg=None) for i in range(45)]
+    assert fe.select_representative(frames, [], 3) == []
+
+
+def test_selection_relaxes_the_gap_rather_than_returning_too_few():
+    frames = [_Rec(ts=0.0), _Rec(ts=0.05), _Rec(ts=0.1)]
+    assert len(fe.select_representative(frames, [], 3)) == 3
+
+
+def test_selection_handles_a_window_smaller_than_the_request():
+    assert len(fe.select_representative([_Rec(ts=0.0)], [], 3)) == 1
+
+
+def test_selection_of_zero_frames_is_empty():
+    assert fe.select_representative(_window(), [], 0) == []

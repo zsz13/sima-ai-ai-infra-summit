@@ -103,6 +103,19 @@ button{font:inherit;color:inherit}
 .against{margin-top:18px;font-size:12.5px;color:var(--faint);max-width:44em}
 .against b{font-variation-settings:'wght' 600;color:var(--dim)}
 
+/* grounded evidence metrics, under the verdict */
+.metrics{display:flex;flex-wrap:wrap;gap:clamp(18px,2.6vw,40px);margin-top:clamp(18px,2.2vw,28px)}
+.metric{min-width:0}
+.metric .v{font-size:clamp(19px,2.4vw,28px);font-variation-settings:'wght' 600;line-height:1.1}
+.metric .k{font-size:11.5px;color:var(--faint);margin-top:4px}
+.metric .sub{font-size:11.5px;color:var(--dim);margin-top:2px}
+.metric.absent .v{color:var(--fail)}
+.metric.full .v{color:var(--pass)}
+.basis{
+  margin-top:16px;font-size:11.5px;color:var(--faint);
+  border-left:2px solid var(--rule);padding-left:10px;max-width:52em;line-height:1.5
+}
+
 /* right column */
 .stack{display:grid;gap:var(--gap);grid-template-rows:minmax(0,1fr) auto;min-height:0}
 .evidence{
@@ -113,9 +126,23 @@ button{font:inherit;color:inherit}
   padding:10px 14px;border-bottom:1px solid var(--rule);
   font-size:11.5px;color:var(--faint);display:flex;justify-content:space-between;gap:10px
 }
-.evidence .frame{flex:1;display:grid;place-items:center;min-height:0;background:#0F1417;padding:10px}
-.evidence img{max-width:100%;max-height:100%;object-fit:contain;display:block}
-.evidence .blank{color:var(--faint);font-size:13px;text-align:center;padding:24px;max-width:26ch;line-height:1.5}
+.evidence .frames{
+  flex:1;display:grid;grid-template-rows:repeat(3,1fr);gap:8px;
+  min-height:0;background:#0F1417;padding:8px
+}
+.shot{position:relative;min-height:0;display:grid;place-items:center;overflow:hidden;background:#0B0F11}
+.shot img{width:100%;height:100%;object-fit:contain;display:block}
+.shot .boxes{position:absolute;inset:0;pointer-events:none}
+.shot .bx{position:absolute;border:1.5px solid var(--wait);box-shadow:0 0 0 1px rgba(0,0,0,.45)}
+.shot .bx span{
+  position:absolute;top:-15px;left:-1.5px;white-space:nowrap;
+  font-size:10px;line-height:14px;padding:0 4px;background:var(--wait);color:#12171A
+}
+.shot .t{
+  position:absolute;left:6px;bottom:5px;font-size:10.5px;color:var(--ink);
+  background:rgba(10,14,16,.72);padding:1px 6px
+}
+.evidence .blank{color:var(--faint);font-size:13px;text-align:center;padding:24px;max-width:26ch;line-height:1.5;grid-row:1/-1;align-self:center}
 
 /* see -> understand -> act chain (a real sequence) */
 .chain{background:var(--housing);border:1px solid var(--rule);display:grid;grid-template-columns:repeat(3,1fr)}
@@ -183,14 +210,17 @@ input[type=text]::placeholder{color:var(--faint)}
       <div class="arming" id="arming"></div>
       <h1 class="verdict small" id="verdict">Waiting for the line</h1>
       <p class="reason quiet" id="reason">Connect the Modalix DevKit, state the standard, then place an item in view.</p>
+      <div class="metrics" id="metrics"></div>
       <p class="against" id="against"></p>
+      <p class="basis" id="basis"></p>
     </section>
 
     <div class="stack">
       <section class="evidence">
-        <div class="cap"><span>Evidence frame</span><span id="evtime"></span></div>
-        <div class="frame" id="frame">
-          <p class="blank">The frame the vision-language model actually judged appears here.</p>
+        <div class="cap"><span id="evcap">Evidence frames</span><span id="evtime"></span></div>
+        <div class="frames" id="frames">
+          <p class="blank">The frames the vision-language model actually judged appear here,
+             sampled across the evidence window.</p>
         </div>
       </section>
 
@@ -234,7 +264,13 @@ input[type=text]::placeholder{color:var(--faint)}
 const $ = id => document.getElementById(id);
 const SIGNAL = {pass:'var(--pass)', fail:'var(--fail)', unclear:'var(--wait)'};
 
-fetch('/api/config').then(r=>r.json()).then(c=>{ $('insight').href = c.insight_url; })
+fetch('/api/config').then(r=>r.json()).then(c=>{
+  $('insight').href = c.insight_url;
+  if (!c.temporal){
+    $('notice').textContent =
+      'Single-frame fallback mode: no temporal evidence and no detector grounding.';
+  }
+})
   .catch(()=>{});
 
 function fmtMs(ms){
@@ -285,6 +321,12 @@ function render(s){
     reason.className = 'reason';
     signal = SIGNAL[latest.verdict] || 'var(--faint)';
     against.innerHTML = 'Judged against <b>' + escapeHtml(latest.standard) + '</b>';
+  } else if (s.warming_up){
+    verdict.textContent = 'Filling the window'; verdict.className = 'verdict small';
+    reason.textContent = 'Collecting ' + (s.window_s || 3) + ' seconds of detector evidence '
+      + 'before judging anything. ' + (s.window_frames || 0) + ' frames so far.';
+    reason.className = 'reason quiet';
+    signal = 'var(--wait)';
   } else if (s.gate_state === 'settling'){
     verdict.textContent = 'Hold still'; verdict.className = 'verdict small';
     reason.textContent = 'Waiting for the item to settle before spending an inference.';
@@ -298,17 +340,89 @@ function render(s){
   $('slab').style.setProperty('--signal', signal);
   arming.style.width = (s.gate_state === 'settling' ? s.gate_progress*100 : 0) + '%';
 
-  // --- evidence ---
-  const frame = $('frame');
-  if (latest && latest.evidence_path){
-    const src = '/api/evidence/' + latest.evidence_path.replace('evidence/','');
-    if (frame.dataset.src !== src){
-      frame.dataset.src = src;
-      frame.innerHTML = '<img alt="Frame judged by the vision-language model">';
-      frame.firstChild.src = src;
+  // --- evidence: grounded metrics, never a manufactured confidence ---
+  const metrics = $('metrics'), basis = $('basis');
+  metrics.innerHTML = ''; basis.textContent = '';
+  if (latest){
+    const cards = [];
+    for (const o of (latest.required_objects || [])){
+      const pct = Math.round(o.presence_ratio * 100);
+      cards.push({
+        v: pct + '%',
+        k: o.label + ' present',
+        sub: o.frames_present + ' / ' + o.frames_total + ' frames',
+        cls: o.frames_present === 0 ? 'absent' : (pct >= 60 ? 'full' : '')
+      });
+      if (o.frames_present > 0){
+        cards.push({v: Math.round(o.conf_median * 100) + '%',
+                    k: 'detector confidence', sub: 'median over the window'});
+      }
     }
-    $('evtime').textContent = new Date(latest.ts*1000).toLocaleTimeString();
+    for (const o of (latest.prohibited_objects || [])){
+      const pct = Math.round(o.presence_ratio * 100);
+      cards.push({v: pct + '%', k: o.label + ' present (prohibited)',
+                  sub: o.frames_present + ' / ' + o.frames_total + ' frames',
+                  cls: o.frames_present === 0 ? 'full' : 'absent'});
+    }
+    const v = latest.vlm || {};
+    if (v.frames_judged){
+      const agree = Math.max(v.frames_supporting || 0, v.frames_contradicting || 0);
+      cards.push({v: agree + ' / ' + v.frames_judged,
+                  k: 'frames in agreement', sub: 'across the evidence window'});
+    }
+    if (latest.window && latest.window.total_frames){
+      cards.push({v: latest.window.total_frames,
+                  k: 'frames of evidence',
+                  sub: (latest.window.duration_s || 0).toFixed(1) + ' s window'});
+    }
+    metrics.innerHTML = cards.map(c =>
+      '<div class="metric ' + (c.cls || '') + '">' +
+      '<div class="v">' + escapeHtml(c.v) + '</div>' +
+      '<div class="k">' + escapeHtml(c.k) + '</div>' +
+      (c.sub ? '<div class="sub">' + escapeHtml(c.sub) + '</div>' : '') + '</div>').join('');
+
+    const why = {
+      'detector-absent': 'Decided by the detector: a required object was never seen in the window. The language model cannot override this.',
+      'detector-prohibited': 'Decided by the detector: a prohibited object was reliably present.',
+      'intermittent-required': 'Decided by the detector: the required object appeared too inconsistently to judge.',
+      'intermittent-prohibited': 'Decided by the detector: a prohibited object appeared intermittently.',
+      'insufficient-window': 'Too little evidence had been collected to judge.',
+      'vlm-contradictory': 'The language model read the frames differently from one another.',
+      'vlm': 'Detector grounding was satisfied, so the language model judged the relationship.',
+      'single-frame-fallback': 'Single-frame fallback: no temporal evidence and no detector grounding.'
+    }[latest.decided_by] || '';
+    basis.textContent = [why, ...(latest.notes || [])].filter(Boolean).join(' ');
   }
+
+  // --- representative frames, with the boxes that grounded the verdict ---
+  const framesEl = $('frames');
+  const shots = (latest && latest.frames && latest.frames.length)
+    ? latest.frames
+    : (latest && latest.evidence_path
+        ? [{path: latest.evidence_path, rel_ts: null, detections: []}] : []);
+  const key = shots.map(f => f.path).join('|');
+  if (framesEl.dataset.key !== key){
+    framesEl.dataset.key = key;
+    framesEl.innerHTML = shots.length ? shots.map(f => {
+      const src = '/api/evidence/' + String(f.path).replace('evidence/', '');
+      const boxes = (f.detections || []).map(d => {
+        const [x1, y1, x2, y2] = d.bbox || [0, 0, 0, 0];
+        const st = 'left:' + (x1 * 100) + '%;top:' + (y1 * 100) + '%;width:' +
+                   ((x2 - x1) * 100) + '%;height:' + ((y2 - y1) * 100) + '%';
+        return '<div class="bx" style="' + st + '"><span>' +
+               escapeHtml(d.label) + ' ' + Math.round((d.confidence || 0) * 100) + '%</span></div>';
+      }).join('');
+      const t = (f.rel_ts === null || f.rel_ts === undefined)
+        ? '' : '<div class="t">+' + Number(f.rel_ts).toFixed(1) + ' s</div>';
+      return '<div class="shot"><img alt="Evidence frame judged by the model" src="' +
+             src + '"><div class="boxes">' + boxes + '</div>' + t + '</div>';
+    }).join('')
+      : '<p class="blank">The frames the vision-language model actually judged appear here, ' +
+        'sampled across the evidence window.</p>';
+  }
+  $('evcap').textContent = shots.length > 1
+    ? shots.length + ' evidence frames' : 'Evidence frame';
+  if (latest) $('evtime').textContent = new Date(latest.ts * 1000).toLocaleTimeString();
 
   // --- the three-stage chain, measured ---
   $('m-see').textContent = s.connected ? (s.fps ? s.fps.toFixed(0)+' fps' : '—') : '—';

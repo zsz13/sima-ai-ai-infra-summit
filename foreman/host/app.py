@@ -8,6 +8,11 @@ Environment:
     FOREMAN_PORT       port for this server (default 8800)
     FOREMAN_AUDIT_DIR  audit trail location (default ./audit)
     FOREMAN_INSIGHT_URL  Neat Insight viewer URL surfaced in the UI
+    FOREMAN_TEMPORAL     1 (default) for temporal grounding, 0 for the single-frame fallback
+    FOREMAN_WINDOW_S     rolling evidence window, seconds (default 3.0)
+    FOREMAN_EVIDENCE_FRAMES  representative frames per inspection (default 3)
+    FOREMAN_ABSENT_RATIO_MAX / FOREMAN_PRESENT_RATIO_MIN / FOREMAN_MIN_WINDOW_FRAMES
+                         grounding thresholds; see host/policy.py
 """
 
 from __future__ import annotations
@@ -26,6 +31,7 @@ from fastapi.staticfiles import StaticFiles
 from .edge_client import EdgeClient, EdgeError
 from .gate import GateConfig
 from .orchestrator import Orchestrator
+from .policy import GroundingConfig
 
 ROOT = Path(__file__).resolve().parents[1]
 FRONTEND = ROOT / "frontend"
@@ -37,6 +43,10 @@ INSIGHT_URL = os.environ.get(
     "FOREMAN_INSIGHT_URL", "https://127.0.0.1:8081/static/viewer.html?src=0"
 )
 
+#: Temporal grounding is the default. FOREMAN_TEMPORAL=0 restores the previous
+#: single-frame behaviour, kept as a fallback while the temporal path is proven.
+TEMPORAL = os.environ.get("FOREMAN_TEMPORAL", "1") != "0"
+
 orchestrator = Orchestrator(
     edge=EdgeClient(EDGE_URL),
     audit_dir=AUDIT_DIR,
@@ -44,6 +54,15 @@ orchestrator = Orchestrator(
         min_confidence=float(os.environ.get("FOREMAN_MIN_CONF", "0.55")),
         stable_frames=int(os.environ.get("FOREMAN_STABLE_FRAMES", "6")),
         absent_frames=int(os.environ.get("FOREMAN_ABSENT_FRAMES", "10")),
+    ),
+    temporal=TEMPORAL,
+    window_s=float(os.environ.get("FOREMAN_WINDOW_S", "3.0")),
+    evidence_frames=int(os.environ.get("FOREMAN_EVIDENCE_FRAMES", "3")),
+    grounding=GroundingConfig(
+        absent_ratio_max=float(os.environ.get("FOREMAN_ABSENT_RATIO_MAX", "0.10")),
+        present_ratio_min=float(os.environ.get("FOREMAN_PRESENT_RATIO_MIN", "0.60")),
+        min_confidence=float(os.environ.get("FOREMAN_MIN_CONF", "0.55")),
+        min_window_frames=int(os.environ.get("FOREMAN_MIN_WINDOW_FRAMES", "10")),
     ),
 )
 
@@ -61,7 +80,13 @@ app = FastAPI(title="Foreman", lifespan=lifespan)
 
 @app.get("/api/config")
 async def config() -> dict:
-    return {"edge_url": EDGE_URL, "insight_url": INSIGHT_URL}
+    return {
+        "edge_url": EDGE_URL,
+        "insight_url": INSIGHT_URL,
+        "temporal": TEMPORAL,
+        "window_s": orchestrator.window_s,
+        "evidence_frames": orchestrator.evidence_frames,
+    }
 
 
 @app.get("/api/state")

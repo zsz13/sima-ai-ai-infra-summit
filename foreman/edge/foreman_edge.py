@@ -45,6 +45,8 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections import deque
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 pyneat = None  # type: ignore
@@ -70,32 +72,70 @@ def load_runtime_dependencies() -> None:
 
 # ---------------------------------------------------------------- state
 
-class Latest:
-    """The most recent frame and detections, shared with the HTTP threads."""
+@dataclass
+class FrameRecord:
+    """One pulled sample: detections always, pixels only for encoded frames."""
+    frame_id: int
+    ts: float
+    detections: list  # list[dict]
+    jpeg: bytes | None = None
+    sharpness: float = 0.0
 
-    def __init__(self) -> None:
+
+class EvidenceBuffer:
+    """Rolling window of recent frames, shared with the HTTP threads.
+
+    Detections are kept for every frame - they are tiny and they are the temporal
+    grounding signal. JPEGs are kept only for every Nth frame, which at 15 fps and
+    the default N=3 leaves about 15 candidate images across a 3 s window: enough
+    to pick 3 well-separated representatives without paying to encode every frame.
+    """
+
+    def __init__(self, window_s: float = 3.0, max_frames: int = 300) -> None:
         self._lock = threading.Lock()
-        self.frame_jpeg: bytes | None = None
-        self.detections: list[dict] = []
-        self.frame_id: int = 0
-        self.ts: float = 0.0
+        self._frames: deque[FrameRecord] = deque(maxlen=max_frames)
+        self.window_s = window_s
         self.detector_ms: float = 0.0
 
-    def set(self, jpeg: bytes | None, detections: list[dict], frame_id: int, detector_ms: float) -> None:
+    def add(self, record: FrameRecord, detector_ms: float) -> None:
         with self._lock:
-            if jpeg is not None:
-                self.frame_jpeg = jpeg
-            self.detections = detections
-            self.frame_id = frame_id
-            self.ts = time.time()
+            self._frames.append(record)
             self.detector_ms = detector_ms
+            cutoff = record.ts - self.window_s
+            while self._frames and self._frames[0].ts < cutoff:
+                self._frames.popleft()
 
-    def snapshot(self) -> tuple[bytes | None, list[dict], int, float, float]:
+    def window(self, seconds: float | None = None) -> list[FrameRecord]:
+        """Every frame within the last `seconds`, oldest first."""
         with self._lock:
-            return self.frame_jpeg, list(self.detections), self.frame_id, self.ts, self.detector_ms
+            if not self._frames:
+                return []
+            span = self.window_s if seconds is None else seconds
+            cutoff = self._frames[-1].ts - span
+            return [f for f in self._frames if f.ts >= cutoff]
+
+    def latest(self) -> FrameRecord | None:
+        with self._lock:
+            return self._frames[-1] if self._frames else None
+
+    def latest_jpeg(self) -> tuple[bytes | None, float]:
+        """Most recent encoded frame and its timestamp."""
+        with self._lock:
+            for rec in reversed(self._frames):
+                if rec.jpeg is not None:
+                    return rec.jpeg, rec.ts
+        return None, 0.0
+
+    def stats(self) -> dict:
+        with self._lock:
+            n = len(self._frames)
+            imgs = sum(1 for f in self._frames if f.jpeg is not None)
+            bytes_held = sum(len(f.jpeg) for f in self._frames if f.jpeg)
+            return {"frames": n, "image_frames": imgs, "buffer_bytes": bytes_held,
+                    "detector_ms": round(self.detector_ms, 2)}
 
 
-LATEST = Latest()
+LATEST = EvidenceBuffer()
 SUBSCRIBERS: set[queue.Queue] = set()
 SUBSCRIBERS_LOCK = threading.Lock()
 STOPPING = threading.Event()
@@ -176,6 +216,78 @@ class GenAI:
                 metrics[dst] = float(usage[src])
         return verdict, reason, metrics
 
+    def judge_window(self, jpegs: list[bytes], standard: str,
+                     detector_summary: str) -> tuple[dict, dict]:
+        """Judge a short evidence window from several frames in ONE request.
+
+        Multi-image support was verified on this hardware: three images in one
+        request are received and described individually (see docs/BENCHMARKS.md,
+        "Multi-image support"). One call is preferred over N calls because it
+        lets the model reason across time and costs ~3.1 s instead of ~4 s.
+
+        The detector's own findings are put in the prompt so the model is told
+        what was actually measured rather than left to guess - but the binding
+        constraint is enforced on the Mac, in host/policy.py, not here.
+        """
+        n = len(jpegs)
+        prompt = (
+            "You are a careful visual inspection system. You are shown "
+            f"{n} still frames captured over about three seconds, in time order.\n\n"
+            f"REQUIREMENT: {standard}\n\n"
+            f"DETECTOR EVIDENCE (measured, not your opinion):\n{detector_summary}\n\n"
+            "Rules you must follow:\n"
+            "- Judge ONLY what is directly visible in these frames.\n"
+            "- Never state that an object is present unless you can actually see it.\n"
+            "- Never infer an object from context, from the scene type, or from what "
+            "would usually be there.\n"
+            "- Keep what you SEE separate from what you ASSUME. Report only what you see.\n"
+            "- Use all the frames together: an object briefly hidden in one frame but "
+            "clearly visible in others is still present.\n"
+            "- If the frames disagree with each other, answer UNCLEAR.\n"
+            "- If you cannot see enough to decide, answer UNCLEAR.\n"
+            "- If the detector evidence says a required object was never found, you "
+            "may not claim it is present.\n\n"
+            "Answer with JSON only, no other text, and keep it SHORT - every "
+            "string under 15 words, at most two items per list:\n"
+            "Follow this shape exactly, but write your own values - never copy the "
+            "example text:\n"
+            '{"meets_requirement":false,"verdict":"FAIL",'
+            f'"per_frame":[{",".join(["false"] * n)}],'
+            '"evidence":["hands are visible and empty"],'
+            '"missing_evidence":["any phone in the hand"],'
+            '"reason":"No phone is visible in any frame."}\n'
+            f'"per_frame" must have exactly {n} entries, one per frame in order: '
+            "true if that frame supports the requirement, false if it contradicts "
+            "it, null if you cannot tell from that frame. Do not describe the "
+            "frames individually.\n"
+            'Set "verdict" to "PASS" only when "meets_requirement" is true, and to '
+            '"FAIL" when it is false. The two must agree.'
+        )
+        content = [{"type": "text", "text": prompt}]
+        for jpeg in jpegs:
+            content.append({"type": "image_url", "image_url": {
+                "url": "data:image/jpeg;base64," + base64.b64encode(jpeg).decode()}})
+
+        started = time.monotonic()
+        result = self._post_json("/v1/chat/completions", {
+            "model": self.vlm_model,
+            "messages": [{"role": "user", "content": content}],
+            "max_tokens": 260,
+        })
+        elapsed_ms = (time.monotonic() - started) * 1000.0
+
+        text = ""
+        with contextlib.suppress(KeyError, IndexError, TypeError):
+            text = result["choices"][0]["message"]["content"]
+
+        usage = result.get("usage") or {}
+        metrics = {"inference_ms": round(elapsed_ms, 1), "vlm_calls": 1, "frames_sent": n}
+        for src, dst in (("ttft_ms", "ttft_ms"), ("tokens_per_second", "tokens_per_s"),
+                         ("completion_tokens", "completion_tokens")):
+            if src in usage:
+                metrics[dst] = float(usage[src])
+        return parse_window_judgement(text, n), metrics
+
     def transcribe(self, audio: bytes, filename: str) -> dict:
         """Whisper on the MLA, via the server's /v1/audio/transcriptions."""
         body, content_type = encode_multipart({
@@ -196,6 +308,96 @@ class GenAI:
             "no_speech_prob": float(result.get("no_speech_prob", 0.0) or 0.0),
             "metrics": {"inference_ms": round(elapsed_ms, 1)},
         }
+
+
+def _strip_fence(raw: str) -> str:
+    raw = (raw or "").strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1] if "```" in raw[3:] else raw[3:]
+        raw = raw.removeprefix("json").strip()
+    return raw
+
+
+def _clean_text(value, fallback: str) -> str:
+    """Trim a model string, rejecting schema placeholders it copied verbatim.
+
+    Observed on hardware: the model returned the literal "<one short sentence>"
+    from the prompt's own schema. A placeholder is worse than nothing, because it
+    looks like a real explanation in the UI.
+    """
+    text = str(value or "").strip()[:400]
+    if not text:
+        return fallback
+    if text.startswith("<") and text.endswith(">"):
+        return fallback
+    if text.lower() in {"<one short sentence>", "string", "reason", "n/a"}:
+        return fallback
+    return text
+
+
+def parse_window_judgement(text: str, frames_sent: int) -> dict:
+    """Parse the multi-frame reply into the shape host/policy.py expects.
+
+    Anything unparseable becomes UNCLEAR with an explanation rather than a
+    guessed verdict - an inspection result must never be invented here.
+    """
+    raw = _strip_fence(text)
+    start, end = raw.find("{"), raw.rfind("}")
+    obj = None
+    if start != -1 and end > start:
+        with contextlib.suppress(ValueError):
+            obj = json.loads(raw[start:end + 1])
+    if not isinstance(obj, dict):
+        return {"verdict": "unclear", "reason": "The model did not return usable JSON.",
+                "evidence": [], "missing_evidence": [], "per_frame": [None] * frames_sent}
+
+    verdict = str(obj.get("verdict", "")).strip().lower()
+    if verdict not in {"pass", "fail", "unclear"}:
+        verdict = "unclear"
+
+    # The model is asked for a boolean and a verdict string. On this model they
+    # sometimes disagree - observed: verdict "pass" with the reason "the person is
+    # not holding a smartphone". A disagreement means the answer is not
+    # trustworthy, so it becomes UNCLEAR rather than a confident verdict.
+    meets = obj.get("meets_requirement")
+    contradiction = False
+    if isinstance(meets, bool) and verdict in {"pass", "fail"}:
+        if (meets is True) != (verdict == "pass"):
+            contradiction = True
+            verdict = "unclear"
+    elif isinstance(meets, bool) and verdict == "unclear":
+        pass
+
+    per_frame: list[bool | None] = []
+    for entry in (obj.get("per_frame") or [])[:frames_sent]:
+        supports = entry.get("supports") if isinstance(entry, dict) else entry
+        per_frame.append(supports if isinstance(supports, bool) else None)
+    while len(per_frame) < frames_sent:
+        per_frame.append(None)
+
+    def strlist(key):
+        value = obj.get(key) or []
+        if isinstance(value, str):
+            value = [value]
+        out, seen = [], set()
+        for item in value:
+            text = _clean_text(item, "")
+            if text and text not in seen:
+                seen.add(text)
+                out.append(text)
+        return out[:4]
+
+    reason = _clean_text(obj.get("reason"), "No reason given.")
+    if contradiction:
+        reason = f"The model contradicted itself, so this needs a human. {reason}"
+
+    return {
+        "verdict": verdict,
+        "reason": reason,
+        "evidence": strlist("evidence"),
+        "missing_evidence": strlist("missing_evidence"),
+        "per_frame": per_frame,
+    }
 
 
 def parse_verdict(text: str) -> tuple[str, str]:
@@ -351,6 +553,25 @@ def nv12_to_bgr(payload, width: int, height: int, planar_i420: bool = False):
     return cv2.cvtColor(np.ascontiguousarray(stacked), code)
 
 
+def luma_sharpness(payload, width: int, height: int) -> float:
+    """Variance of the Laplacian over a downscaled luma plane.
+
+    NV12 stores luma first, so this needs no colour conversion. Downscaling to
+    320 px wide keeps the cost negligible at 15 fps while still separating a
+    motion-blurred frame from a sharp one. Higher is sharper; the absolute value
+    is scene-dependent and is only ever compared within one evidence window.
+    """
+    try:
+        arr = np.frombuffer(payload, dtype=np.uint8)
+        aligned_h = height if arr.size == width * height * 3 // 2 else int(arr.size // (width * 1.5))
+        y = arr[:aligned_h * width].reshape(aligned_h, width)[:height, :]
+        small = cv2.resize(y, (320, max(1, int(320 * height / width))),
+                           interpolation=cv2.INTER_AREA)
+        return float(cv2.Laplacian(small, cv2.CV_64F).var())
+    except Exception:
+        return 0.0
+
+
 def frame_to_jpeg(tensor, quality: int) -> bytes | None:
     """Decoded NV12/I420 tensor -> JPEG bytes, for VLM input and evidence."""
     try:
@@ -370,6 +591,80 @@ def frame_to_jpeg(tensor, quality: int) -> bytes | None:
     except Exception as exc:
         print(f"[foreman-edge] frame encode failed: {exc}", file=sys.stderr, flush=True)
         return None
+
+
+def detector_summary(frames, required, prohibited) -> str:
+    """Plain-language summary of what the detector measured across the window.
+
+    Goes into the VLM prompt so the model is told the measurement instead of
+    guessing. The binding constraint is still applied on the Mac.
+    """
+    total = len(frames)
+    lines = []
+    for label in [*required, *prohibited]:
+        present = sum(1 for f in frames
+                      if any(d.get("label") == label for d in f.detections))
+        pct = round(100 * present / total) if total else 0
+        if present == 0:
+            lines.append(f"- {label}: NEVER detected in any of {total} frames.")
+        else:
+            lines.append(f"- {label}: detected in {present}/{total} frames ({pct}%).")
+    if not lines:
+        lines.append("- no detector-supported objects were named in this requirement.")
+    return "\n".join(lines)
+
+
+def select_representative(frames, required, count: int, min_gap_s: float | None = None):
+    """Pick `count` sharp, well-separated frames that show the required objects.
+
+    Greedy by score, but a candidate is rejected if it sits within `min_gap_s` of
+    an already-chosen frame. Bucketing alone was not enough: with three buckets
+    over three seconds, frames at +0.9 s and +1.0 s land in different buckets yet
+    are effectively the same instant, which defeats the point of temporal
+    evidence. The gap defaults to 60% of an even split.
+
+    If the gap cannot be satisfied (short or sparse window) it is relaxed rather
+    than returning fewer frames, because three near frames still beat one.
+
+    Score combines: how many required objects the frame shows, the detector
+    confidence for them, and sharpness normalised against this window - the
+    absolute Laplacian variance is scene-dependent and only comparable within it.
+    """
+    candidates = [f for f in frames if f.jpeg is not None]
+    if not candidates or count <= 0:
+        return []
+
+    span = max(candidates[-1].ts - candidates[0].ts, 1e-6)
+    if min_gap_s is None:
+        min_gap_s = (span / count) * 0.6
+    sharp_max = max((f.sharpness for f in candidates), default=0.0) or 1.0
+
+    def score(rec) -> float:
+        hits, conf = 0, 0.0
+        for label in required:
+            best = max((float(d.get("confidence", 0.0)) for d in rec.detections
+                        if d.get("label") == label), default=0.0)
+            if best > 0:
+                hits += 1
+                conf += best
+        object_score = (hits / len(required)) if required else 0.0
+        conf_score = (conf / len(required)) if required else 0.0
+        return 2.0 * object_score + 1.0 * conf_score + 1.0 * (rec.sharpness / sharp_max)
+
+    ranked = sorted(candidates, key=score, reverse=True)
+    chosen: list = []
+    gap = min_gap_s
+    while len(chosen) < count and gap >= 0:
+        for rec in ranked:
+            if len(chosen) >= count:
+                break
+            if any(r is rec for r in chosen):
+                continue
+            if all(abs(rec.ts - r.ts) >= gap for r in chosen):
+                chosen.append(rec)
+        gap = gap / 2 if gap > 0.02 else -1  # relax, then give up on the constraint
+
+    return sorted(chosen, key=lambda r: r.ts)
 
 
 # ------------------------------------------------------------ pipeline
@@ -533,16 +828,22 @@ class Pipeline:
             except Exception as exc:
                 print(f"[foreman-edge] box decode failed: {exc}", file=sys.stderr, flush=True)
 
-            jpeg = None
+            jpeg, sharpness = None, 0.0
             if n % every == 0:
                 frame_field = find_field(sample, "frame")
                 tensor = first_tensor(frame_field if frame_field is not None else sample)
                 if tensor is not None:
                     jpeg = frame_to_jpeg(tensor, self.args.jpeg_quality)
+                    if jpeg is not None:
+                        sharpness = luma_sharpness(tensor.copy_payload_bytes(),
+                                                   tensor_dim(tensor, "width"),
+                                                   tensor_dim(tensor, "height"))
 
             detector_ms = (time.monotonic() - started) * 1000.0
             frame_id = int(getattr(sample, "frame_id", n) or n)
-            LATEST.set(jpeg, detections, frame_id, detector_ms)
+            LATEST.add(FrameRecord(frame_id=frame_id, ts=time.time(),
+                                   detections=detections, jpeg=jpeg,
+                                   sharpness=sharpness), detector_ms)
 
             self._send_metadata(sample, detections)
             publish({
@@ -626,18 +927,23 @@ def make_handler(genai: GenAI, args):
 
         def do_GET(self):
             if self.path == "/health":
-                _, detections, frame_id, ts, detector_ms = LATEST.snapshot()
+                rec = LATEST.latest()
+                stats = LATEST.stats()
                 return self._json(200, {
                     "ok": True,
                     "models": {"detector": args.model.rsplit("/", 1)[-1],
                                "vlm": args.vlm_model, "asr": args.asr_model},
-                    "frame_id": frame_id, "last_frame_age_s": round(time.time() - ts, 2) if ts else None,
-                    "detector_ms": round(detector_ms, 2),
+                    "frame_id": rec.frame_id if rec else 0,
+                    "last_frame_age_s": round(time.time() - rec.ts, 2) if rec else None,
+                    "detector_ms": stats["detector_ms"],
+                    "window_s": args.window_s,
+                    "evidence_frames": args.evidence_frames,
+                    "buffer": stats,
                 })
             if self.path == "/events":
                 return self._events()
             if self.path == "/frame.jpg":
-                jpeg, *_ = LATEST.snapshot()
+                jpeg, _ = LATEST.latest_jpeg()
                 if jpeg is None:
                     return self._json(503, {"error": "no frame yet"})
                 self.send_response(200)
@@ -677,11 +983,20 @@ def make_handler(genai: GenAI, args):
         def do_POST(self):
             if self.path == "/inspect":
                 return self._inspect()
+            if self.path == "/inspect_single":
+                return self._inspect_single()
             if self.path == "/transcribe":
                 return self._transcribe()
             return self._json(404, {"error": "not found"})
 
         def _inspect(self):
+            """Judge a rolling evidence window, not a single frame.
+
+            Returns raw evidence - the window bounds, the selected frames and the
+            model's structured reply. It deliberately does NOT return a final
+            verdict: the grounding policy that can override the model lives on
+            the Mac, in host/policy.py, where it is unit-testable without hardware.
+            """
             try:
                 body = json.loads(self._read_body() or b"{}")
             except ValueError:
@@ -690,20 +1005,82 @@ def make_handler(genai: GenAI, args):
             if not standard:
                 return self._json(400, {"error": "standard is required"})
 
-            jpeg, _, _, ts, _ = LATEST.snapshot()
+            required = [str(x) for x in (body.get("required_objects") or [])]
+            prohibited = [str(x) for x in (body.get("prohibited_objects") or [])]
+            window_s = float(body.get("window_s") or args.window_s)
+            want = int(body.get("num_frames") or args.evidence_frames)
+
+            t_sel = time.monotonic()
+            frames = LATEST.window(window_s)
+            if not frames:
+                return self._json(503, {"error": "no frames buffered yet"})
+            if time.time() - frames[-1].ts > 5.0:
+                return self._json(503, {"error": "camera frames are stale; check the RTSP source"})
+
+            selected = select_representative(frames, required, want)
+            if not selected:
+                return self._json(503, {"error": "no encoded frames in the evidence window"})
+            selection_ms = (time.monotonic() - t_sel) * 1000.0
+
+            summary = detector_summary(frames, required, prohibited)
+            try:
+                judgement, metrics = genai.judge_window(
+                    [f.jpeg for f in selected], standard, summary)
+            except (urllib.error.URLError, OSError, ValueError) as exc:
+                return self._json(502, {"error": f"vision-language model unavailable: {exc}"})
+
+            metrics["selection_ms"] = round(selection_ms, 1)
+            t0 = frames[0].ts
+            return self._json(200, {
+                "window": {
+                    "start_ts": t0,
+                    "end_ts": frames[-1].ts,
+                    "duration_s": round(frames[-1].ts - t0, 3),
+                    "total_frames": len(frames),
+                    "image_frames": sum(1 for f in frames if f.jpeg is not None),
+                },
+                "detector_summary": summary,
+                "selected": [{
+                    "frame_id": f.frame_id,
+                    "ts": f.ts,
+                    "rel_ts": round(f.ts - t0, 3),
+                    "sharpness": round(f.sharpness, 1),
+                    "detections": [{k: v for k, v in d.items() if k != "_px"}
+                                   for d in f.detections],
+                    "jpeg_b64": base64.b64encode(f.jpeg).decode(),
+                } for f in selected],
+                "vlm": judgement,
+                "metrics": metrics,
+            })
+
+        def _inspect_single(self):
+            """The pre-temporal single-frame path, kept as a fallback.
+
+            Judges the most recent encoded frame with no temporal evidence and no
+            detector grounding - i.e. the behaviour that allowed a hallucinated
+            object to PASS. Reachable only when the Mac is started with
+            FOREMAN_TEMPORAL=0, and retained so the previously demonstrated
+            pipeline stays runnable while the temporal one is being proven.
+            """
+            try:
+                body = json.loads(self._read_body() or b"{}")
+            except ValueError:
+                return self._json(400, {"error": "invalid JSON"})
+            standard = str(body.get("standard", "")).strip()
+            if not standard:
+                return self._json(400, {"error": "standard is required"})
+
+            jpeg, ts = LATEST.latest_jpeg()
             if jpeg is None:
                 return self._json(503, {"error": "no frame available from the camera yet"})
             if time.time() - ts > 5.0:
                 return self._json(503, {"error": "camera frames are stale; check the RTSP source"})
-
             try:
                 verdict, reason, metrics = genai.judge(jpeg, standard)
             except (urllib.error.URLError, OSError, ValueError) as exc:
                 return self._json(502, {"error": f"vision-language model unavailable: {exc}"})
-
             return self._json(200, {
-                "verdict": verdict,
-                "reason": reason,
+                "verdict": verdict, "reason": reason,
                 "evidence_jpeg_b64": base64.b64encode(jpeg).decode(),
                 "metrics": metrics,
             })
@@ -775,6 +1152,10 @@ def parse_args(argv=None):
                    choices=["h264", "h265", "mjpeg"])
     p.add_argument("--latency-ms", type=int, default=200)
     p.add_argument("--jpeg-every", type=int, default=3, help="keep 1 in N frames as JPEG")
+    p.add_argument("--window-s", type=float, default=float(env("FOREMAN_WINDOW_S", "3.0")),
+                   help="rolling evidence window in seconds")
+    p.add_argument("--evidence-frames", type=int, default=int(env("FOREMAN_EVIDENCE_FRAMES", "3")),
+                   help="representative frames sent to the VLM per inspection")
     p.add_argument("--jpeg-quality", type=int, default=85)
     p.add_argument("--profile", action="store_true", help="print the backend pipeline")
     args = p.parse_args(argv)
@@ -799,6 +1180,7 @@ def main(argv=None) -> int:
     args = parse_args(argv)
     load_runtime_dependencies()
 
+    LATEST.window_s = args.window_s
     pipeline = Pipeline(args, load_labels(args.labels))
     pipeline.build()
 
