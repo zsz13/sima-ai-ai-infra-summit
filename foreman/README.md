@@ -34,18 +34,41 @@ floors, pharmacy benches, retail back-rooms, customer goods.
 Put a model that already understands language *and* images on the line itself.
 
 1. **SEE** — a YOLO26 detector runs continuously on the Modalix MLA over the live
-   camera feed. Cheap, real-time, every frame.
-2. **UNDERSTAND** — when the gate decides an item is present and has stopped
-   moving, a vision-language model on the same MLA reads the frame against your
-   spoken standard and returns a verdict *and a written reason*.
-3. **ACT** — the Mac applies pass/fail policy, writes an auditable record with
-   the evidence frame, updates the andon console, and re-arms.
+   camera feed. Cheap, real-time, every frame. The last **3 seconds** are kept in
+   a rolling evidence buffer on the board.
+2. **UNDERSTAND** — when the gate decides an item has settled, **three
+   representative frames** are selected from that window — sharp, temporally
+   separated, showing the objects that matter — and judged by a vision-language
+   model on the same MLA in **one multi-image call**.
+3. **ACT** — the Mac applies the grounding policy, writes an auditable record
+   with all three evidence frames, updates the andon console, and re-arms.
+
+### The detector has the last word
+
+A vision-language model will confidently describe things that are not there. On
+this system it once returned PASS for *"the person must be holding a smartphone"*
+with the reason *"the person is holding a smartphone, as indicated by the visible
+screen"* — with no phone in the room.
+
+So the verdict is **grounded in what the detector measured across the window**,
+not in what the model says it saw:
+
+- a required object the detector **never saw** → **FAIL**, whatever the model claims
+- a required object seen only **intermittently** → **UNCLEAR**, not a guess
+- a prohibited object **reliably present** → **FAIL**
+- grounding satisfied → the model decides the *relationship* ("holding", "closed",
+  "facing up"), which is the part a detector cannot judge
+
+The model can never conjure an object into existence. It can only be trusted with
+the semantics of objects the detector has already confirmed.
 
 Changing the standard is a sentence, not a sprint.
 
 ## Why it matters
 
 - **No training data.** The standard is a prompt, not a dataset.
+- **Grounded in measurement, not assertion.** Every verdict shows the frame counts
+  it rests on.
 - **Reconfigurable by the person who owns the rule**, not by an ML team.
 - **The reason is part of the output.** An operator can disagree with a sentence;
   they cannot disagree with a confidence score.
@@ -94,7 +117,7 @@ Changing the standard is a sentence, not a sprint.
 | Workload | Model | Why it belongs on the MLA |
 |---|---|---|
 | **Object detection** | `yolo_26n` (Model Zoo gen2, INT8) | Continuous CNN inference on every frame. Neat also does anchor decode and NMS in `Model::Options`. Measured 6.3 ms, ~160 fps standalone. |
-| **Visual judgement** | Qwen3-VL-2B-Instruct-GPTQ-a16w4 | Transformer inference with a vision encoder. The heaviest workload in the system. Measured 1368 ms median per judgement. |
+| **Visual judgement** | Qwen3-VL-2B-Instruct-GPTQ-a16w4 | Transformer inference with a vision encoder, **three frames in one multi-image call**. The heaviest workload in the system. Measured 2133 ms median per judgement. |
 | **Speech recognition** | `simaai/whisper-small-a16w8` | SiMa ships Whisper with encoder, decoder (init/pre/cache/post) and language detection compiled as MLA ELFs. Measured RTF ~0.105. |
 | **H.264 encode + RTP** | Neat `VideoSender` | Must share the detector's `Run` so RTP and metadata timestamps correlate inside Insight's ±1 ms window. |
 
@@ -244,7 +267,10 @@ Headline measured figures on a Modalix DevKit 3.0:
 | Vision-language judgement | **1368 ms median** (n=31) |
 | Whisper ASR | **262 ms for 2.50 s of audio, RTF ~0.105** |
 | End-to-end, gate fire to verdict | **1875 ms** (of which ~12 ms is the Mac) |
-| Verdict accuracy, 6 standards x 4 reps | **24/24**, 0 self-inconsistencies |
+| Verdict accuracy, 6 standards x 4 reps (single-frame) | **24/24**, 0 self-inconsistencies |
+| Temporal: VLM latency | **2133 ms** median, 1 call, 3 frames |
+| Temporal: detector under load | 15.2 fps (**-9.0%**) |
+| Temporal: evidence buffer | 46 frames, 0.97 MB |
 | Insight metadata-to-video correlation | **151/151, 0 expired** |
 | Pipelined detector throughput | **778.9 inferences/s** at 5.21 ms |
 | Board temperature, full stack running | 49-50 C (SoC), 55-57 C (board) |
@@ -273,6 +299,12 @@ presented as measurements of this application.
   screening aid, not an authority.
 - **One item at a time.** The gate fires on the most confident qualifying
   detection. Several items in frame at once are judged as one scene.
+- **Grounding only covers the 80 COCO classes.** A standard about a hard hat, a
+  label or a seal has no detector support, so those verdicts rest on the model
+  alone — and the console says so rather than implying grounding it does not have.
+- **The parser is deterministic, not a language model.** It handles "must not",
+  "no X", plurals and clause splitting, but it is not a semantic parser. An
+  unparsed object is reported as ungrounded rather than silently guessed.
 - **The detector and the VLM share one MLA.** Measured, the detector holds 15 fps
   with judgements running - but it is camera-bound at 15 fps and has ~10x headroom,
   so that result does not prove there is no contention at saturation.

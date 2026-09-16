@@ -268,6 +268,39 @@ No Kafka, Redis, or queue broker. None is warranted.
 
 ---
 
+## Temporal grounding (added after the single-frame pipeline shipped)
+
+The first version judged one frame. That let the vision-language model assert an
+object the detector had never seen. The pipeline is now:
+
+```
+camera -> [MODALIX] detector on the MLA, every frame
+       -> [MODALIX] 3 s rolling buffer: detections x45, JPEGs x15
+       -> [MODALIX] select 3 representative frames
+                    (required objects + sharpness + min 0.6 s apart)
+       -> [MODALIX] ONE multi-image VLM call on the MLA
+       -> [MAC]     temporal aggregation + grounding policy
+       -> [MAC]     PASS / FAIL / UNCLEAR + evidence
+```
+
+The split is deliberate: the **edge owns the pixels** (buffer, selection, model
+execution) and the **Mac owns the decision** (aggregation, policy, audit). The
+edge returns evidence and the model's structured reply but **no final verdict**,
+so the rule that can override the model is a pure function on the Mac with no
+hardware in the loop - which is why all seven regression cases are ordinary unit
+tests.
+
+Policy order, evaluated top down (`foreman/host/policy.py`):
+
+| # | Condition | Verdict |
+|---|---|---|
+| 0 | window shorter than `min_window_frames` | UNCLEAR |
+| 1 | required object presence <= `absent_ratio_max` | **FAIL** - model cannot override |
+| 2 | prohibited object presence >= `present_ratio_min` | **FAIL** - model cannot override |
+| 3 | required object presence below `present_ratio_min` | UNCLEAR |
+| 4 | prohibited object present intermittently | UNCLEAR |
+| 5 | grounding satisfied | defer to the model for the relationship |
+
 ## Measurement plan
 
 Recorded in `docs/BENCHMARKS.md`, measured, never estimated. **Model inference
