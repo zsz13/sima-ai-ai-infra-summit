@@ -10,8 +10,16 @@
   --pass:#3FBF6A; --fail:#FF5646; --wait:#F2B417;
   --signal:var(--faint);
   --gap:clamp(12px,1.5vw,20px);
-  --pad:clamp(14px,2vw,24px);
+  --pad:clamp(16px,2.4vw,32px);
   --radius:3px;
+  /* One measure for the header and the main view, so both align on the same
+     left and right edge and the page reads as centred instead of pinned to the
+     left of a wide display. */
+  --shell:1440px;
+  /* The footer gets a narrower measure of its own. At the full shell width the
+     four columns stretch nearly edge to edge and the last one reads as detached
+     from the group rather than part of it. */
+  --shell-foot:1160px;
 }
 
 *{box-sizing:border-box}
@@ -42,9 +50,14 @@ a:hover{color:var(--ink)}
   border-bottom:1px solid var(--rule);
 }
 .topbar-in{
-  max-width:1680px; margin:0 auto; padding:10px var(--pad);
-  display:flex; align-items:center; gap:clamp(10px,1.6vw,22px); flex-wrap:wrap;
+  max-width:var(--shell); margin:0 auto; padding:11px var(--pad);
+  display:flex; align-items:center; justify-content:space-between;
+  gap:10px clamp(14px,2vw,28px); flex-wrap:wrap;
 }
+/* Two clusters rather than seven loose children: when the bar wraps it breaks
+   between them, which looks deliberate instead of ragged. */
+.bar-side{display:flex;align-items:center;gap:clamp(12px,1.6vw,22px);min-width:0;flex-wrap:wrap}
+.bar-side.end{justify-content:flex-end}
 .mark{
   font-variation-settings:'wdth' 70,'wght' 800;
   font-size:16px; letter-spacing:.16em; text-transform:uppercase;
@@ -60,8 +73,6 @@ a:hover{color:var(--ink)}
 }
 .nav a:hover{color:var(--ink);background:var(--housing-2)}
 .nav a[aria-current="page"]{background:var(--housing-2);color:var(--ink);font-variation-settings:'wght' 600}
-
-.topbar .spacer{flex:1 1 auto;min-width:0}
 
 .speech{display:flex;align-items:center;gap:7px;flex:none}
 .speech label{font-size:12px;color:var(--faint);white-space:nowrap}
@@ -85,12 +96,32 @@ a:hover{color:var(--ink)}
   .topbar-in{padding:8px var(--pad)}
 }
 
+/* Below this the bar cannot hold both clusters on one line. Give each its own
+   full-width row and push the selector and the status light to opposite ends,
+   so the wrap reads as a layout rather than an accident. */
+@media(max-width:700px){
+  .topbar-in{gap:6px}
+  .bar-side{flex:1 1 100%}
+  .bar-side.end{justify-content:space-between;gap:10px}
+  .nav{flex:1 1 auto}
+  .nav a{flex:1 1 0;justify-content:center}
+}
+
 
 .dot{width:8px;height:8px;border-radius:50%;background:var(--faint);flex:none}
 .dot.up{background:var(--pass)} .dot.down{background:var(--fail)}
+/* A backend that is not the board gets amber, not green: connected, but not
+   the thing a demo result is supposed to come from. */
+.dot.alt{background:var(--wait)}
 
 /* ---------------------------------------------------------------- shell */
-.page{max-width:1680px;margin:0 auto;padding:var(--pad);display:grid;gap:var(--gap)}
+/* minmax(0,1fr) rather than the implicit column: an implicit grid column takes
+   min-width:auto and grows to its widest content, so the history table's
+   min-width would otherwise stretch the whole page into horizontal scroll. */
+.page{
+  max-width:var(--shell);margin:0 auto;padding:var(--pad);
+  display:grid;grid-template-columns:minmax(0,1fr);gap:var(--gap);
+}
 
 /* standard bar - priority 1 in the inspection view */
 .standardbar{
@@ -181,8 +212,14 @@ a:hover{color:var(--ink)}
 
 /* Evidence cells are exactly 16:9 like the 1280x720 source, so the whole frame
    is visible, nothing is cropped, and box overlays map 1:1 onto the image. */
-.frames{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;background:var(--well);padding:10px}
-@media(max-width:820px){.frames{grid-template-columns:repeat(2,1fr)}}
+/* Three columns on a desktop, so the default six frames read as a balanced
+   3 x 2 block rather than a ragged 5+1. Other counts stay sensible too: three
+   frames fill one row, five give 3+2. Two columns on a tablet, one on a phone. */
+.frames{
+  display:grid;gap:10px;background:var(--well);padding:10px;
+  grid-template-columns:repeat(3,minmax(0,1fr));
+}
+@media(max-width:900px){.frames{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:560px){.frames{grid-template-columns:1fr}}
 .shot{position:relative;aspect-ratio:16/9;background:#080C0E;overflow:hidden;cursor:zoom-in;border:1px solid var(--rule);padding:0;width:100%;display:block}
 .shot:hover{border-color:var(--dim)}
@@ -212,10 +249,100 @@ a:hover{color:var(--ink)}
 .classlist .none{padding:18px 14px;font-size:12.5px;color:var(--faint);line-height:1.55;margin:0}
 .rawnote{padding:10px 14px;border-top:1px solid var(--rule);font-size:11.5px;color:var(--faint);line-height:1.5}
 
+/* Camera Check debug controls */
+.dbgbar{display:flex;align-items:center;gap:10px;padding:9px 14px;border-top:1px solid var(--rule);flex-wrap:wrap}
+.dbgtoggle{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--dim);cursor:pointer;min-height:32px}
+.dbgtoggle input{accent-color:var(--wait);width:15px;height:15px;cursor:pointer}
+.dbgbar input[type=range]{flex:1 1 90px;min-width:80px;accent-color:var(--wait);cursor:pointer}
+.dbgbar input[type=range]:disabled{opacity:.4;cursor:not-allowed}
+.dbgbar output{font-size:12px;color:var(--ink);min-width:34px;text-align:right;font-feature-settings:'tnum' 1}
+/* A below-threshold box is dashed and amber so it can never be mistaken for a
+   detection the policy actually acted on. */
+.bx.dbg{border-style:dashed;border-color:var(--wait);opacity:.85}
+.bx.dbg span{background:transparent;color:var(--wait);border:1px solid var(--wait)}
+.classrow.dbg .c{color:var(--wait)}
+.classrow.dbg .n::after{content:' (below threshold)';color:var(--faint);font-size:11px}
+@media (max-width:940px), (pointer:coarse){ .dbgtoggle{min-height:44px} }
+
+/* ---------------------------------------------------------------- history */
+.hd-actions{display:flex;gap:8px;align-items:center}
+.hd-actions{flex-wrap:wrap}
+.hd-sep{width:1px;height:20px;background:var(--rule)}
+.selcount{margin-left:8px;color:var(--wait);font-variation-settings:'wght' 600}
+/* A quiet column: a checkbox per row, wide enough to tap, narrow enough not to
+   compete with the data. */
+.histtable th.pick,.histtable td.pick{width:34px;padding-left:12px;padding-right:0}
+.histtable td.pick input{accent-color:var(--wait);width:16px;height:16px;cursor:pointer;margin:2px 0 0}
+.histtable tbody tr.row.picked{background:rgba(242,180,23,.07)}
+.histtable tbody tr.row.picked td{border-bottom-color:rgba(242,180,23,.25)}
+@media (max-width:940px), (pointer:coarse){
+  .histtable th.pick,.histtable td.pick{width:44px}
+  .histtable td.pick input{width:20px;height:20px}
+}
+.btn.sm{padding:7px 12px;font-size:12.5px;min-height:36px;text-decoration:none;display:inline-flex;align-items:center}
+@media (max-width:940px), (pointer:coarse){ .btn.sm{min-height:44px} }
+
+/* The table scrolls inside its own panel rather than widening the page, which
+   is what keeps a long standard from forcing a horizontal scrollbar. */
+/* min-width:0 is load-bearing: .panel is a column flex container, and without
+   it the item takes min-width:auto and grows to the table's 720px min-width,
+   pushing the whole page into horizontal scroll on a phone. */
+.tablewrap{overflow-x:auto;-webkit-overflow-scrolling:touch;min-width:0;max-width:100%}
+.histtable{width:100%;border-collapse:collapse;font-size:12.5px;min-width:720px}
+.histtable th,.histtable td{
+  text-align:left;padding:9px 12px;border-bottom:1px solid var(--rule-soft);
+  vertical-align:top;line-height:1.45;
+}
+.histtable thead th{
+  position:sticky;top:0;background:var(--housing-2);color:var(--faint);
+  font-size:11px;letter-spacing:.05em;font-variation-settings:'wght' 600;
+  border-bottom:1px solid var(--rule);z-index:1;
+}
+.histtable tbody tr:last-child td{border-bottom:0}
+.histtable tbody tr.row{cursor:pointer}
+.histtable tbody tr.row:hover{background:rgba(255,255,255,.028)}
+.histtable .num{text-align:right;white-space:nowrap;font-feature-settings:'tnum' 1}
+.histtable .when{white-space:nowrap;color:var(--dim)}
+.histtable .std,.histtable .why{max-width:26ch;overflow-wrap:anywhere;color:var(--ink)}
+.histtable .why{color:var(--dim)}
+.histtable .ev{font-size:11.5px;color:var(--dim);max-width:24ch;overflow-wrap:anywhere}
+
+.vpill{
+  display:inline-block;padding:2px 8px;font-size:11px;white-space:nowrap;
+  font-variation-settings:'wght' 600;border:1px solid;
+}
+.vpill.pass{color:var(--pass);border-color:rgba(63,191,106,.5)}
+.vpill.fail{color:var(--fail);border-color:rgba(255,86,70,.5)}
+.vpill.unclear{color:var(--wait);border-color:rgba(242,180,23,.5)}
+.decided{display:block;margin-top:4px;font-size:10.5px;color:var(--faint)}
+
+/* expanded detail */
+.histtable tr.detail td{background:var(--well);padding:12px}
+.detail-in{display:flex;gap:14px;flex-wrap:wrap;align-items:flex-start}
+.detail-shots{display:flex;gap:8px;flex-wrap:wrap}
+.detail-shots .shot{width:170px;aspect-ratio:16/9;flex:none}
+.detail-meta{flex:1 1 240px;min-width:0;font-size:11.5px;color:var(--dim);line-height:1.6}
+.detail-meta b{color:var(--ink);font-variation-settings:'wght' 600}
+@media(max-width:560px){ .detail-shots .shot{width:100%} }
+
 /* ---------------------------------------------------------------- deck */
-.deck{display:grid;gap:var(--gap);grid-template-columns:minmax(0,1fr) minmax(0,300px)}
-@media(max-width:940px){.deck{grid-template-columns:1fr}}
-.controls{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+/* One toolbar rather than two stacked blocks: controls on the left, the
+   scoreboard on the right, both centred on the same axis so the counters no
+   longer float above the buttons. */
+.deck{
+  margin-top:var(--gap);
+  background:var(--housing);border:1px solid var(--rule);
+  padding:clamp(12px,1.6vw,18px) clamp(14px,1.8vw,20px);
+  display:flex;align-items:center;justify-content:space-between;
+  gap:clamp(14px,2vw,28px);flex-wrap:wrap;
+}
+.controls{display:flex;gap:10px;align-items:center;flex-wrap:wrap;flex:1 1 440px;min-width:0}
+.scoreboard{display:flex;flex-direction:column;justify-content:center;gap:8px;flex:0 0 auto}
+@media(max-width:940px){
+  .deck{align-items:stretch}
+  .controls{flex:1 1 100%}
+  .scoreboard{flex:1 1 100%;border-top:1px solid var(--rule-soft);padding-top:12px}
+}
 .btn{
   background:var(--housing-2); border:1px solid var(--rule); padding:11px 16px;
   cursor:pointer; font-variation-settings:'wght' 500; font-size:13.5px;
@@ -227,22 +354,49 @@ a:hover{color:var(--ink)}
 .btn.rec{border-color:var(--fail);color:#FF9B90}
 .btn.rec[aria-pressed="true"]{background:var(--fail);color:#12171A;border-color:var(--fail);font-variation-settings:'wght' 600}
 .btn.primary{border-color:var(--dim)}
+/* The manual trigger is the one thing an operator reaches for, so it reads as
+   the primary action without shouting over the verdict. */
+/* Mode is a two-state choice, so it reads as a segmented control rather than
+   two buttons that might both be on. */
+.modeswitch{display:flex;gap:2px;background:var(--well);border:1px solid var(--rule);padding:2px;flex:none}
+.btn.seg{border:0;background:transparent;padding:8px 14px;min-height:40px;color:var(--dim);font-size:13px}
+.btn.seg:hover:not(:disabled){background:var(--housing-2);color:var(--ink)}
+.btn.seg[aria-pressed="true"]{background:var(--housing-2);color:var(--ink);font-variation-settings:'wght' 600}
+@media (max-width:940px), (pointer:coarse){ .btn.seg{min-height:44px} }
+
+.btn.go{border-color:var(--pass);color:#8FE0AC;font-variation-settings:'wght' 600}
+.btn.go:hover:not(:disabled){background:rgba(63,191,106,.12);border-color:var(--pass);color:#fff}
+.btn.go:disabled{opacity:.45}
+
+/* Capture lifecycle: one bar and three named steps, so "what is it doing now"
+   is answerable at a glance from across a room. */
+.capture{margin:0 0 clamp(14px,2vw,22px)}
+.capbar{height:4px;background:var(--well);border:1px solid var(--rule);overflow:hidden}
+.capfill{height:100%;width:0;background:var(--wait);transition:width .1s linear}
+.capsteps{display:flex;gap:clamp(10px,2vw,24px);list-style:none;margin:10px 0 0;padding:0;flex-wrap:wrap}
+.capsteps li{font-size:12px;color:var(--faint);display:flex;align-items:center;gap:6px}
+.capsteps li::before{content:'';width:7px;height:7px;border-radius:50%;background:var(--rule);flex:none}
+.capsteps li.done{color:var(--dim)}
+.capsteps li.done::before{background:var(--pass)}
+.capsteps li.now{color:var(--wait);font-variation-settings:'wght' 600}
+.capsteps li.now::before{background:var(--wait)}
 input[type=text]{
   flex:1 1 240px; min-width:0; background:var(--well); border:1px solid var(--rule);
   color:var(--ink); padding:11px 13px; font-size:13.5px; min-height:44px; border-radius:var(--radius);
 }
 input[type=text]::placeholder{color:var(--faint)}
 
-.historywrap{display:flex;flex-direction:column;justify-content:flex-end;gap:7px;min-width:0}
-.historywrap .k{font-size:11.5px;color:var(--faint)}
-.history{display:flex;gap:4px;align-items:flex-end;min-width:0;overflow:hidden;min-height:46px}
+/* The strip collapses to nothing when there are no verdicts, so the counters
+   stay vertically centred instead of being pushed up by an empty row. */
+.history{display:flex;gap:4px;align-items:flex-end;min-width:0;overflow:hidden}
+.history:empty{display:none}
 .tile{flex:0 0 9px;height:34px;background:var(--faint);opacity:.5}
 .tile.pass{background:var(--pass);opacity:1}
 .tile.fail{background:var(--fail);opacity:1;height:46px}
 .tile.unclear{background:var(--wait);opacity:1;height:24px}
 
-.tally{display:flex;gap:20px}
-.tally div{min-width:0}
+.tally{display:flex;gap:clamp(16px,2vw,26px)}
+.tally > div{min-width:0;text-align:right}
 .tally .n{font-size:21px;font-variation-settings:'wght' 600;line-height:1}
 .tally .l{font-size:11px;color:var(--faint);margin-top:3px}
 .tally .p .n{color:var(--pass)} .tally .f .n{color:var(--fail)}
@@ -254,16 +408,66 @@ input[type=text]::placeholder{color:var(--faint)}
 .notice:empty{display:none}
 
 /* ---------------------------------------------------------------- footer */
-.sitefoot{border-top:1px solid var(--rule);margin-top:clamp(18px,3vw,40px);background:var(--ground)}
-.sitefoot-in{
-  max-width:1680px;margin:0 auto;padding:var(--pad);
-  display:flex;gap:clamp(14px,3vw,48px);flex-wrap:wrap;
-  font-size:12.5px;color:var(--faint);line-height:1.6;
+.sitefoot{
+  border-top:1px solid var(--rule);
+  margin-top:clamp(28px,5vw,64px);
+  background:var(--ground);
 }
-.sitefoot-in > div{min-width:0}
-.sitefoot b{display:block;color:var(--dim);font-variation-settings:'wght' 600;font-size:11.5px;letter-spacing:.04em;margin-bottom:4px}
-.sitefoot a{text-decoration:none;border-bottom:1px solid var(--rule)}
-.sitefoot a:hover{border-color:var(--dim)}
+/* Four even columns on a desktop, two on a tablet, one on a phone. Even columns
+   rather than flex so the headings line up on a shared baseline grid. */
+.sitefoot-in{
+  max-width:var(--shell-foot);margin:0 auto;
+  padding:clamp(24px,3vw,36px) var(--pad) clamp(20px,2.4vw,28px);
+  display:grid;grid-template-columns:repeat(4,minmax(0,1fr));
+  gap:clamp(20px,2.6vw,40px);
+}
+@media(max-width:900px){.sitefoot-in{grid-template-columns:repeat(2,minmax(0,1fr));gap:26px clamp(20px,4vw,44px)}}
+@media(max-width:460px){.sitefoot-in{grid-template-columns:1fr;gap:22px}}
+
+.foot-col{min-width:0}
+.foot-col h2{
+  margin:0 0 8px;font-size:11px;letter-spacing:.06em;color:var(--faint);
+  font-variation-settings:'wght' 600;
+}
+.foot-col p{margin:0;line-height:1.5;overflow-wrap:anywhere}
+.foot-col .lead{font-size:13.5px;color:var(--ink)}
+.foot-col .sub{font-size:11.5px;color:var(--faint);margin-top:3px}
+/* The repository path is longer than its column at every width, so it is
+   clipped with an ellipsis; the full path stays in the title and the link. */
+.foot-col .sub.repo{
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  overflow-wrap:normal;direction:ltr;
+}
+
+.foot-link{
+  display:inline-flex;align-items:center;gap:7px;
+  color:var(--ink);text-decoration:none;
+  border-bottom:1px solid var(--rule);padding-bottom:1px;
+  transition:color .15s,border-color .15s;
+}
+.foot-link:hover{color:#fff;border-color:var(--dim)}
+.foot-link:focus-visible{outline:2px solid var(--wait);outline-offset:3px;border-bottom-color:transparent}
+/* The mark keeps its own square; currentColor ties it to the link state and
+   width/height on the <svg> stop it stretching. */
+.foot-link .ico{flex:none;display:block}
+/* On a touch screen these are the only tappable things down here, so give them
+   a real target instead of the bare height of a line of 13px text. */
+@media (max-width:940px), (pointer:coarse){
+  .foot-link{padding:9px 0 10px}
+}
+
+/* The rule spans the footer group; the sentence is centred under it and kept
+   short enough to read as a caption rather than one long line. */
+.sitefoot-note{
+  max-width:var(--shell-foot);margin:0 auto;
+  padding:0 var(--pad) clamp(22px,2.6vw,30px);
+  border-top:1px solid var(--rule-soft);
+}
+.sitefoot-note p{
+  margin:16px auto 0;max-width:62ch;
+  font-size:11px;line-height:1.6;color:var(--faint);text-align:center;
+  text-wrap:balance;
+}
 
 /* ---------------------------------------------------------------- dialog */
 dialog{
@@ -286,3 +490,41 @@ dialog::backdrop{background:rgba(6,9,11,.82)}
 .lightbox .cap{position:absolute;left:0;bottom:-28px;font-size:12px;color:var(--dim);right:0}
 
 @media(prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+
+
+/* ---- one or two rules -------------------------------------------------- */
+/* The rule inputs sit under the buttons rather than inline, so the applied
+   text stays readable at any width instead of being squeezed into a toolbar. */
+.rules{display:flex;flex-direction:column;gap:8px;margin-top:10px}
+.rule{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.rule .rlabel{flex:0 0 auto;min-width:3.6rem;font-size:.78rem;letter-spacing:.02em;
+  color:var(--muted);text-transform:none}
+.rule input{flex:1 1 18rem;min-width:0}
+/* An applied rule is visibly settled; an edited one is visibly a draft again. */
+.rule input.applied{border-color:color-mix(in srgb,var(--ok) 55%,transparent);
+  background:color-mix(in srgb,var(--ok) 7%,var(--panel))}
+.rule input.draft{border-color:color-mix(in srgb,var(--warn) 55%,transparent)}
+.btn.small{padding:6px 10px;font-size:.82rem}
+.btn.ghost{background:transparent;border-style:dashed;align-self:flex-start}
+
+/* ---- per-rule results -------------------------------------------------- */
+.rulesresult{list-style:none;margin:14px 0 0;padding:0;display:flex;
+  flex-direction:column;gap:8px}
+.rulesresult li{display:grid;grid-template-columns:auto auto 1fr;gap:10px;
+  align-items:baseline;padding:10px 12px;border:1px solid var(--line);
+  border-radius:10px;background:var(--panel)}
+.rulesresult .rn{font-size:.78rem;color:var(--muted);white-space:nowrap}
+.rulesresult .rv{font-weight:650;letter-spacing:.04em;font-size:.82rem;white-space:nowrap}
+.rulesresult .rv.pass{color:var(--ok)}
+.rulesresult .rv.fail{color:var(--bad)}
+.rulesresult .rv.unclear{color:var(--warn)}
+.rulesresult .rr{color:var(--fg);font-size:.92rem;min-width:0;overflow-wrap:anywhere}
+.rulesresult .rt{grid-column:1 / -1;color:var(--muted);font-size:.8rem;
+  overflow-wrap:anywhere}
+
+@media (max-width:560px){
+  .rule .rlabel{flex:1 1 100%}
+  .rule input{flex:1 1 100%}
+  .rulesresult li{grid-template-columns:auto 1fr}
+  .rulesresult .rr{grid-column:1 / -1}
+}

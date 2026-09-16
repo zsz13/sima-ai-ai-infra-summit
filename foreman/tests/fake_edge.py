@@ -58,11 +58,22 @@ app = FastAPI(title="fake-edge (TEST HARNESS)")
 STATE = {
     "present": False,      # is an item in frame?
     "label": "box",        # what the detector reports seeing
+    #: Several classes in the same frame, for multi-rule tests. When None the
+    #: harness emits the single STATE["label"].
+    "labels": None,
     "bbox": [0.30, 0.30, 0.60, 0.60],
     "verdict": "pass",
     "reason": "Synthetic verdict from the test harness. Not a real inference.",
     "inspect_delay": 0.05,
     "inspect_calls": 0,
+    #: One entry per rule when a request carries `rules`. Each is
+    #: (verdict, reason, observed_relationship). Falls back to the single-rule
+    #: STATE["verdict"]/["reason"] when unset.
+    "rule_results": None,
+    #: How long the harness pretends a manual capture takes. Short enough to keep
+    #: the suite fast, long enough that the orchestrator's ring really does hold
+    #: frames for the reported window.
+    "capture_sim_s": 0.8,
     "fps": 30.0,
     "window_frames": 45,
     "per_frame": [True, True, True],
@@ -72,9 +83,19 @@ STATE = {
 }
 
 
+def _detections() -> list[dict]:
+    """Detections for one frame: every configured class, or the single label."""
+    if not STATE["present"]:
+        return []
+    labels = STATE["labels"] or [STATE["label"]]
+    return [{"label": lb, "confidence": 0.93, "bbox": list(STATE["bbox"]),
+             "track_id": i + 1} for i, lb in enumerate(labels)]
+
+
 @app.get("/health")
 async def health() -> dict:
-    return {"ok": True, "harness": True, "models": {"detector": "fake", "vlm": "fake", "asr": "fake"}}
+    return {"ok": True, "harness": True, "backend": "fake",
+            "models": {"detector": "fake", "vlm": "fake", "asr": "fake"}}
 
 
 @app.get("/events")
@@ -83,14 +104,7 @@ async def events() -> StreamingResponse:
         frame_id = 0
         while True:
             frame_id += 1
-            dets = []
-            if STATE["present"]:
-                dets = [{
-                    "label": STATE["label"],
-                    "confidence": 0.93,
-                    "bbox": list(STATE["bbox"]),
-                    "track_id": 1,
-                }]
+            dets = _detections()
             payload = {"frame_id": frame_id, "ts": time.time(), "detections": dets}
             yield f"data: {json.dumps(payload)}\n\n"
             await asyncio.sleep(1.0 / STATE["fps"])
@@ -107,33 +121,87 @@ async def inspect(body: dict) -> dict:
     window_s = float(body.get("window_s") or 3.0)
     want = int(body.get("num_frames") or 3)
     total = int(STATE["window_frames"])
-    start = now - window_s
+    # A manual capture judges frames collected AFTER the request arrives, so a
+    # real edge blocks for the whole capture and its window is the interval that
+    # just elapsed. The harness blocks too - briefly - because a window that has
+    # not happened yet would contain no frames and would hide exactly the bug the
+    # preparation delay exists to prevent. Only the auto path looks backwards.
+    manual = float(body.get("capture_s") or 0.0) > 0
+    if manual:
+        arrival = now
+        await asyncio.sleep(STATE["capture_sim_s"])
+        now = time.time()
+        start = arrival
+        window_s = now - arrival
+    else:
+        start = now - window_s
 
     selected = [{
         "frame_id": 1000 + i,
         "ts": start + (i + 0.5) * window_s / max(want, 1),
         "rel_ts": round((i + 0.5) * window_s / max(want, 1), 3),
         "sharpness": 120.0 - i,
-        "detections": ([{"label": STATE["label"], "confidence": 0.93,
-                         "bbox": list(STATE["bbox"]), "track_id": 1}]
-                       if STATE["present"] else []),
+        "detections": _detections(),
         "jpeg_b64": TINY_JPEG_B64,
     } for i in range(want)]
 
+    # A manual request arrives only after the host has finished preparing, so
+    # the capture it reports starts now - never at the button press. Mirrors what
+    # both real edges return, which is what lets a test measure the delay.
+    capture_s = float(body.get("capture_s") or 0.0)
+    capture = ({"mode": "manual", "requested_s": capture_s,
+                "start_ts": start, "end_ts": now,
+                "detector_frames": total}
+               if capture_s > 0 else {"mode": "auto"})
+
+    def judgement(verdict, reason, observed=None):
+        return {
+            "verdict": verdict,
+            "reason": reason,
+            "evidence": list(STATE["vlm_evidence"]),
+            "missing_evidence": list(STATE["vlm_missing"]),
+            "observed_relationship": observed,
+            "per_frame": [list(STATE["per_frame"])[i % len(STATE["per_frame"])]
+                          for i in range(want)] if STATE["per_frame"] else [None] * want,
+        }
+
+    # One judgement per rule, from the SAME selected frames. The harness never
+    # re-captures: `inspect_calls` counts requests, so a test can prove that two
+    # rules cost one capture rather than two.
+    rules = body.get("rules") or []
+    if rules:
+        configured = STATE["rule_results"] or []
+        vlms = []
+        for i, _rule in enumerate(rules):
+            if i < len(configured):
+                v, r, *rest = configured[i]
+                vlms.append(judgement(v, r, rest[0] if rest else None))
+            else:
+                vlms.append(judgement(STATE["verdict"], STATE["reason"]))
+    else:
+        vlms = [judgement(STATE["verdict"], STATE["reason"])]
+
     return {
-        "window": {"start_ts": start, "end_ts": now, "duration_s": window_s,
+        "capture": capture,
+        "window": {"start_ts": start, "end_ts": start + window_s, "duration_s": window_s,
                    "total_frames": total, "image_frames": max(want, total // 3)},
         "detector_summary": STATE["detector_summary"],
         "selected": selected,
+        "vlms": vlms,
         "vlm": {
             "verdict": STATE["verdict"],
             "reason": STATE["reason"],
             "evidence": list(STATE["vlm_evidence"]),
             "missing_evidence": list(STATE["vlm_missing"]),
-            "per_frame": list(STATE["per_frame"])[:want] or [None] * want,
+            # One entry per image sent, like a real model: pad by repeating the
+            # configured pattern rather than returning a short list, which would
+            # understate how many frames agreed.
+            "per_frame": [list(STATE["per_frame"])[i % len(STATE["per_frame"])]
+                          for i in range(want)] if STATE["per_frame"] else [None] * want,
         },
         "metrics": {"inference_ms": 3050.0, "ttft_ms": 260.0,
-                    "vlm_calls": 1, "frames_sent": want, "selection_ms": 1.2},
+                    "vlm_calls": len(vlms), "frames_sent": want, "selection_ms": 1.2,
+                    "temporal_frames": want},
     }
 
 

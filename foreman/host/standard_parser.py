@@ -128,6 +128,35 @@ RU_SYNONYMS: dict[str, str] = {
     "медвед": "bear", "овц": "sheep", "коров": "cow",
 }
 
+#: Objects that inspection standards routinely mention and the detector has NO
+#: class for. Naming them is the point: without this list, "the person must be
+#: holding a pen" parses to exactly the same thing as "a person must be visible",
+#: and the console cannot tell the operator that the pen is unchecked. Being
+#: explicit is what stops detector evidence being claimed for something the
+#: detector cannot see. This is a short honest list, not an attempt at a noun
+#: lexicon - anything not in it is simply silent, as before.
+EN_UNSUPPORTED: dict[str, str] = {
+    "pen": "pen", "pencil": "pencil", "marker": "marker", "stylus": "stylus",
+    "hard hat": "hard hat", "helmet": "helmet", "hardhat": "hard hat",
+    "glove": "glove", "gloves": "glove", "goggles": "goggles",
+    "mask": "mask", "face mask": "mask", "badge": "badge", "lanyard": "lanyard",
+    "label": "label", "sticker": "sticker", "barcode": "barcode",
+    "cap": "cap", "lid": "lid", "seal": "seal", "screw": "screw", "bolt": "bolt",
+    "wire": "wire", "cable": "cable", "tag": "tag", "vest": "vest",
+    "watch": "watch", "ring": "ring", "glasses": "glasses", "earbuds": "earbuds",
+    "headphones": "headphones", "wallet": "wallet", "key": "key", "keys": "key",
+}
+
+RU_UNSUPPORTED: dict[str, str] = {
+    "ручк": "pen", "карандаш": "pencil", "маркер": "marker",
+    "каск": "hard hat", "шлем": "helmet", "перчатк": "glove", "очк": "goggles",
+    "маск": "mask", "бейдж": "badge", "этикетк": "label", "наклейк": "sticker",
+    "штрихкод": "barcode", "крышк": "cap", "пломб": "seal", "винт": "screw",
+    "провод": "wire", "кабел": "cable", "жилет": "vest", "часы наручные": "watch",
+    "кольц": "ring", "наушник": "headphones", "кошелёк": "wallet",
+    "кошелек": "wallet", "ключ": "key",
+}
+
 #: Russian noun endings. Deliberately a closed set rather than "any few letters":
 #: a wildcard suffix makes "стол" match "столько" and "кот" match "который".
 #: "о" is needed for neuter nominatives - without it "кресло" and "яблоко" did not
@@ -167,6 +196,21 @@ RU_NEGATIONS = (
 EN_CLAUSE_SPLIT = re.compile(r",|\band\b|\bbut\b|\bwhile\b|\bwhereas\b|;")
 RU_CLAUSE_SPLIT = re.compile(r",|\bи\b|\bно\b|\bа\b|\bтакже\b|;")
 
+#: Verbs that describe a relationship between two objects rather than the
+#: presence of one. These are the reason "the person must not be holding a phone"
+#: cannot be reduced to "the phone is prohibited": the phone may sit on the table
+#: all day without breaking the rule. Each entry maps a pattern to the canonical
+#: relation name the policy and the prompt both use.
+EN_RELATIONS = (
+    (r"\bhold(?:ing|s)?\b", "holding"),
+    (r"\bcarry(?:ing|ies)?\b|\bcarried\b", "holding"),
+    (r"\bin (?:their|his|her|the|its) hands?\b", "holding"),
+)
+RU_RELATIONS = (
+    (r"\bдерж\w*", "holding"),
+    (r"\bв рук\w*", "holding"),
+)
+
 _CYRILLIC = re.compile(r"[Ѐ-ӿ]")
 _LATIN = re.compile(r"[A-Za-z]")
 
@@ -185,11 +229,17 @@ class Lexicon:
     negations_are_regex: bool
     #: optional inflection suffix appended to every synonym pattern
     ending: str
+    #: everyday objects the detector has no class for, so they can be named
+    unsupported: dict[str, str]
+    #: (pattern, relation name) for verbs that relate two objects
+    relations: tuple[tuple[str, str], ...] = ()
 
 
 LEXICONS: dict[str, Lexicon] = {
-    "en": Lexicon(EN_SYNONYMS, EN_NEGATIONS, EN_CLAUSE_SPLIT, True, "e?s?"),
-    "ru": Lexicon(RU_SYNONYMS, RU_NEGATIONS, RU_CLAUSE_SPLIT, True, RU_ENDING),
+    "en": Lexicon(EN_SYNONYMS, EN_NEGATIONS, EN_CLAUSE_SPLIT, True, "e?s?", EN_UNSUPPORTED,
+                  EN_RELATIONS),
+    "ru": Lexicon(RU_SYNONYMS, RU_NEGATIONS, RU_CLAUSE_SPLIT, True, RU_ENDING, RU_UNSUPPORTED,
+                  RU_RELATIONS),
 }
 
 
@@ -203,6 +253,30 @@ def detect_language(text: str) -> str:
     cyr = len(_CYRILLIC.findall(text or ""))
     lat = len(_LATIN.findall(text or ""))
     return "ru" if cyr > lat else "en"
+
+
+def surface_names(label: str, language: str | None = None) -> set[str]:
+    """Every word a standard or a model might use for one COCO class.
+
+    "cell phone" is what the detector calls it; an operator says "phone" and a
+    Russian reply says "телефон". A guard that only knows the English class name
+    cannot check a Russian sentence, so the synonym tables are inverted here to
+    give the check something to match against.
+    """
+    names = {label.lower()}
+    if " " in label:
+        names.add(label.lower().split()[-1])
+    langs = (language,) if language in LEXICONS else tuple(LEXICONS)
+    for lang in langs:
+        for phrase, cls in LEXICONS[lang].synonyms.items():
+            if cls == label:
+                names.add(phrase.lower())
+    return names
+
+
+def known_labels() -> set[str]:
+    """Every COCO class any lexicon can name."""
+    return {cls for lex in LEXICONS.values() for cls in lex.synonyms.values()}
 
 
 def resolve_language(text: str, preferred: str | None = None) -> str:
@@ -226,13 +300,73 @@ class ParsedStandard:
     required: tuple[str, ...] = ()
     #: COCO classes that must NOT be present
     prohibited: tuple[str, ...] = ()
+    #: objects the standard names that the detector has no class for. They are
+    #: NOT evidence; they exist so the console can say which parts of a rule the
+    #: detector cannot check, instead of implying it checked everything.
+    unsupported: tuple[str, ...] = ()
     #: the language the standard was parsed as
     language: str = "en"
+    #: canonical name of the relationship the standard is about ("holding"), or
+    #: None for a plain presence rule
+    relation: str | None = None
+    #: the object doing the relating, normally "person"
+    relation_subject: str | None = None
+    #: the object it is related to, e.g. "cell phone"
+    relation_object: str | None = None
+    #: the value the relationship must take for the standard to be met. True for
+    #: "must be holding", False for "must NOT be holding". None when there is no
+    #: relationship. This is the field that stops a negated rule collapsing into
+    #: a prohibited object: the object may be present either way.
+    relation_expected: bool | None = None
 
     @property
     def is_grounded(self) -> bool:
         """True when at least one object can be checked against the detector."""
-        return bool(self.required or self.prohibited)
+        return bool(self.required or self.prohibited or self.relation_object)
+
+    @property
+    def tracked_objects(self) -> tuple[str, ...]:
+        """Every class the detector must measure for this standard.
+
+        The object of a forbidden relationship is included even though it is not
+        prohibited: the policy cannot judge "not holding the phone" without
+        knowing whether a phone was there at all.
+        """
+        out = list(self.required) + list(self.prohibited)
+        if self.relation_object and self.relation_object not in out:
+            out.append(self.relation_object)
+        return tuple(out)
+
+    def rule_signature(self) -> tuple:
+        """The normalised rule, independent of wording or language.
+
+        Two standards with the same signature must be treated identically, and
+        two with different signatures must not. The positive and negative
+        phrasings of a relationship differ only in the last element, which is
+        exactly the distinction that used to be lost.
+        """
+        return (tuple(sorted(self.required)), tuple(sorted(self.prohibited)),
+                self.relation, self.relation_subject, self.relation_object,
+                self.relation_expected)
+
+    def describe_rule(self) -> str:
+        """The normalised rule in words, for the audit trail and debug views."""
+        if not self.relation:
+            bits = []
+            if self.required:
+                bits.append("must be present: " + ", ".join(self.required))
+            if self.prohibited:
+                bits.append("must not be present: " + ", ".join(self.prohibited))
+            return "; ".join(bits) or "no checkable objects"
+        verb = self.relation.upper()
+        expected = "YES" if self.relation_expected else "NO"
+        return (f"{self.relation_subject} {verb} {self.relation_object} "
+                f"— required: {expected}")
+
+    @property
+    def fully_grounded(self) -> bool:
+        """True when every object the standard names can be checked by the detector."""
+        return self.is_grounded and not self.unsupported
 
     def public(self) -> dict:
         return {
@@ -240,7 +374,14 @@ class ParsedStandard:
             "language": self.language,
             "required": list(self.required),
             "prohibited": list(self.prohibited),
+            "unsupported": list(self.unsupported),
             "grounded": self.is_grounded,
+            "fully_grounded": self.fully_grounded,
+            "relation": self.relation,
+            "relation_subject": self.relation_subject,
+            "relation_object": self.relation_object,
+            "relation_expected": self.relation_expected,
+            "rule": self.describe_rule(),
         }
 
 
@@ -263,6 +404,14 @@ def _match_objects(clause: str, lex: Lexicon) -> list[tuple[int, str]]:
         # blank the span so a shorter synonym cannot re-match inside it
         remaining = re.sub(pattern, lambda m: " " * len(m.group(0)), remaining)
     return sorted(found)
+
+
+def _relation_position(clause: str, lex: Lexicon) -> tuple[int, str] | None:
+    """(offset, relation name) of the earliest relationship verb, or None."""
+    hits = [(m.start(), name)
+            for pattern, name in lex.relations
+            if (m := re.search(pattern, clause))]
+    return min(hits) if hits else None
 
 
 def _negation_position(clause: str, lex: Lexicon) -> int | None:
@@ -300,13 +449,41 @@ def parse_standard(text: str, language: str | None = None) -> ParsedStandard:
     required: list[str] = []
     prohibited: list[str] = []
 
+    relation = relation_subject = relation_object = None
+    relation_expected: bool | None = None
+
     for clause in lex.clause_split.split(low):
         clause = clause.strip()
         if not clause:
             continue
         neg_at = _negation_position(clause, lex)
+        objects = _match_objects(clause, lex)
+
+        # A relationship clause is handled before presence polarity, because its
+        # negation applies to the relationship and not to the object. "must not
+        # be holding a phone" leaves the phone perfectly legal to have in shot.
+        rel = _relation_position(clause, lex)
+        if rel is not None and relation is None:
+            rel_at, rel_name = rel
+            before = [c for pos, c in objects if pos < rel_at]
+            after = [c for pos, c in objects if pos > rel_at]
+            if before and after:
+                relation = rel_name
+                relation_subject = before[0]
+                relation_object = after[0]
+                relation_expected = not (neg_at is not None and neg_at < rel_at)
+                # The subject still has to be there for the rule to mean
+                # anything. The object does not: with no phone in the room the
+                # person cannot be holding one, which satisfies a negative rule
+                # and fails a positive one - decided by the policy, not here.
+                if relation_subject not in required:
+                    required.append(relation_subject)
+                if relation_expected and relation_object not in required:
+                    required.append(relation_object)
+                continue
+
         prohibited_in_clause = 0
-        for pos, cls in _match_objects(clause, lex):
+        for pos, cls in objects:
             if neg_at is not None and pos > neg_at:
                 # Only the first object after the cue is prohibited. In
                 # "no bottles on the table" the table is the location, not a
@@ -318,10 +495,22 @@ def parse_standard(text: str, language: str | None = None) -> ParsedStandard:
             elif cls not in required:
                 required.append(cls)
 
+    unsupported: list[str] = []
+    for phrase in sorted(lex.unsupported, key=len, reverse=True):
+        if re.search(rf"\b{re.escape(phrase)}{lex.ending}\b", low):
+            name = lex.unsupported[phrase]
+            if name not in unsupported:
+                unsupported.append(name)
+
     required = [c for c in required if c not in prohibited]
     return ParsedStandard(
         raw=raw,
         required=tuple(required),
         prohibited=tuple(prohibited),
+        unsupported=tuple(unsupported),
         language=lang,
+        relation=relation,
+        relation_subject=relation_subject,
+        relation_object=relation_object,
+        relation_expected=relation_expected,
     )
