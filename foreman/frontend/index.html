@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Foreman</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%23141A1E'/%3E%3Ccircle cx='8' cy='8' r='4' fill='%233FBF6A'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:ital,wdth,wght@0,62..125,100..900&display=swap" rel="stylesheet">
+<style>
+:root{
+  --ground:#141A1E; --housing:#1C242A; --housing-2:#222C33;
+  --rule:#2E3A42; --ink:#E8EDF0; --dim:#8A9AA5; --faint:#5C6C77;
+  --pass:#3FBF6A; --fail:#FF4D3D; --wait:#F2B417;
+  --signal:var(--faint);
+  --gap:clamp(12px,1.6vw,22px);
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0; background:var(--ground); color:var(--ink);
+  font-family:Archivo,system-ui,sans-serif;
+  font-variation-settings:'wdth' 100;
+  font-feature-settings:'tnum' 1;
+  -webkit-font-smoothing:antialiased;
+}
+button{font:inherit;color:inherit}
+:focus-visible{outline:2px solid var(--wait);outline-offset:3px}
+
+/* ---------- shell ---------- */
+.console{
+  height:100%; display:grid; gap:var(--gap); padding:var(--gap);
+  grid-template-rows:auto minmax(0,1fr) auto;
+}
+
+/* ---------- status rail ---------- */
+.rail{
+  display:flex; align-items:center; gap:clamp(14px,2vw,28px);
+  flex-wrap:wrap; padding-bottom:12px; border-bottom:1px solid var(--rule);
+}
+.mark{
+  font-variation-settings:'wdth' 72,'wght' 700;
+  font-size:15px; letter-spacing:.14em; color:var(--faint);
+  text-transform:uppercase; flex:none;
+}
+.standard{flex:1 1 320px; min-width:0}
+.standard .k{font-size:11.5px;color:var(--faint);letter-spacing:.06em}
+.standard .v{
+  font-size:clamp(14px,1.5vw,17px); font-variation-settings:'wght' 500;
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis; margin-top:2px;
+}
+.standard .v.none{color:var(--faint);font-variation-settings:'wght' 400 ,'ital' 1;font-style:italic}
+.link{
+  color:var(--dim); font-size:12.5px; text-decoration:none;
+  border-bottom:1px solid var(--rule); padding-bottom:2px;
+}
+.link:hover{color:var(--ink);border-color:var(--dim)}
+
+.health{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--dim);flex:none}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--faint);flex:none}
+.dot.up{background:var(--pass)}
+.dot.down{background:var(--fail)}
+
+.tally{display:flex;gap:18px;flex:none}
+.tally div{text-align:right}
+.tally .n{font-size:22px;font-variation-settings:'wght' 600;line-height:1}
+.tally .l{font-size:11px;color:var(--faint);margin-top:3px}
+.tally .p .n{color:var(--pass)} .tally .f .n{color:var(--fail)}
+
+/* ---------- main ---------- */
+.floor{display:grid;gap:var(--gap);grid-template-columns:minmax(0,1.55fr) minmax(0,1fr);min-height:0}
+@media(max-width:900px){.floor{grid-template-columns:1fr;grid-template-rows:minmax(320px,1fr) auto}}
+
+/* verdict slab — the andon */
+.slab{
+  position:relative; background:var(--housing); border:1px solid var(--rule);
+  border-left:4px solid var(--signal); padding:clamp(20px,3vw,40px);
+  display:flex; flex-direction:column; justify-content:center; min-height:0;
+  overflow:hidden;
+}
+.slab::after{ /* status wash, never decoration for its own sake */
+  content:''; position:absolute; inset:0; pointer-events:none;
+  background:radial-gradient(120% 100% at 0% 50%, var(--signal) 0%, transparent 62%);
+  opacity:.09; transition:opacity .35s ease;
+}
+.arming{
+  position:absolute; top:0; left:0; height:3px; background:var(--wait);
+  width:0%; transition:width .12s linear;
+}
+.verdict{
+  font-size:clamp(56px,11vw,150px); line-height:.84;
+  font-variation-settings:'wdth' 88,'wght' 800; letter-spacing:-.015em;
+  color:var(--signal); margin:0; text-transform:uppercase;
+}
+.verdict.small{font-size:clamp(26px,4.2vw,52px);font-variation-settings:'wdth' 92,'wght' 600;text-transform:none;letter-spacing:-.01em;color:var(--ink)}
+.reason{
+  margin:clamp(16px,2vw,26px) 0 0; max-width:34em;
+  font-size:clamp(15px,1.75vw,21px); line-height:1.45; color:var(--ink);
+  font-variation-settings:'wght' 400;
+}
+.reason.quiet{color:var(--dim)}
+.against{margin-top:18px;font-size:12.5px;color:var(--faint);max-width:44em}
+.against b{font-variation-settings:'wght' 600;color:var(--dim)}
+
+/* right column */
+.stack{display:grid;gap:var(--gap);grid-template-rows:minmax(0,1fr) auto;min-height:0}
+.evidence{
+  background:var(--housing); border:1px solid var(--rule);
+  display:flex;flex-direction:column;min-height:0;
+}
+.evidence .cap{
+  padding:10px 14px;border-bottom:1px solid var(--rule);
+  font-size:11.5px;color:var(--faint);display:flex;justify-content:space-between;gap:10px
+}
+.evidence .frame{flex:1;display:grid;place-items:center;min-height:0;background:#0F1417;padding:10px}
+.evidence img{max-width:100%;max-height:100%;object-fit:contain;display:block}
+.evidence .blank{color:var(--faint);font-size:13px;text-align:center;padding:24px;max-width:26ch;line-height:1.5}
+
+/* see -> understand -> act chain (a real sequence) */
+.chain{background:var(--housing);border:1px solid var(--rule);display:grid;grid-template-columns:repeat(3,1fr)}
+.chain .step{padding:14px 16px;border-right:1px solid var(--rule);min-width:0}
+.chain .step:last-child{border-right:0}
+.chain .s{font-size:12px;color:var(--faint);font-variation-settings:'wght' 500}
+.chain .n{font-size:clamp(17px,2.2vw,25px);font-variation-settings:'wght' 600;line-height:1.15;margin-top:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.chain .w{font-size:11.5px;color:var(--dim);margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+/* ---------- controls + history ---------- */
+.deck{display:flex;gap:var(--gap);align-items:stretch;flex-wrap:wrap}
+.controls{display:flex;gap:10px;align-items:center;flex:1 1 420px;min-width:0}
+.btn{
+  background:var(--housing-2);border:1px solid var(--rule);padding:11px 16px;
+  cursor:pointer;font-variation-settings:'wght' 500;font-size:13.5px;white-space:nowrap;
+  transition:border-color .15s,background .15s;
+}
+.btn:hover:not(:disabled){border-color:var(--dim);background:#27333B}
+.btn:disabled{opacity:.42;cursor:not-allowed}
+.btn.rec{border-color:var(--fail);color:var(--fail)}
+.btn.rec[aria-pressed="true"]{background:var(--fail);color:#12171A;border-color:var(--fail)}
+input[type=text]{
+  flex:1 1 200px;min-width:0;background:#0F1417;border:1px solid var(--rule);
+  color:var(--ink);padding:11px 13px;font:inherit;font-size:13.5px;
+}
+input[type=text]::placeholder{color:var(--faint)}
+
+.historywrap{flex:1 1 260px;min-width:0;display:flex;flex-direction:column;justify-content:flex-end;gap:7px}
+.historywrap .k{font-size:11.5px;color:var(--faint)}
+.history{display:flex;gap:4px;align-items:flex-end;min-width:0;overflow:hidden;min-height:46px}
+.tile{flex:0 0 9px;height:34px;background:var(--faint);opacity:.5}
+.tile.pass{background:var(--pass);opacity:1}
+.tile.fail{background:var(--fail);opacity:1;height:46px}
+.tile.unclear{background:var(--wait);opacity:1;height:24px}
+
+.notice{
+  flex:1 1 100%;font-size:12.5px;color:var(--fail);
+  border-left:2px solid var(--fail);padding:8px 12px;background:rgba(255,77,61,.07)
+}
+.notice:empty{display:none}
+
+@media(prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+</style>
+</head>
+<body>
+<div class="console">
+
+  <header class="rail">
+    <div class="mark">Foreman</div>
+    <div class="standard">
+      <div class="k">Inspecting against</div>
+      <div class="v none" id="standard">No standard set</div>
+    </div>
+    <a class="link" id="insight" href="#" target="_blank" rel="noopener">Live camera view</a>
+    <div class="health"><span class="dot" id="dot"></span><span id="health">Connecting</span></div>
+    <div class="tally">
+      <div class="p"><div class="n" id="n-pass">0</div><div class="l">Passed</div></div>
+      <div class="f"><div class="n" id="n-fail">0</div><div class="l">Failed</div></div>
+      <div><div class="n" id="n-total">0</div><div class="l">Inspected</div></div>
+    </div>
+  </header>
+
+  <main class="floor">
+    <section class="slab" id="slab" aria-live="polite">
+      <div class="arming" id="arming"></div>
+      <h1 class="verdict small" id="verdict">Waiting for the line</h1>
+      <p class="reason quiet" id="reason">Connect the Modalix DevKit, state the standard, then place an item in view.</p>
+      <p class="against" id="against"></p>
+    </section>
+
+    <div class="stack">
+      <section class="evidence">
+        <div class="cap"><span>Evidence frame</span><span id="evtime"></span></div>
+        <div class="frame" id="frame">
+          <p class="blank">The frame the vision-language model actually judged appears here.</p>
+        </div>
+      </section>
+
+      <section class="chain">
+        <div class="step">
+          <div class="s">See</div>
+          <div class="n" id="m-see">—</div>
+          <div class="w">Detector on Modalix MLA</div>
+        </div>
+        <div class="step">
+          <div class="s">Understand</div>
+          <div class="n" id="m-understand">—</div>
+          <div class="w">Vision-language model on MLA</div>
+        </div>
+        <div class="step">
+          <div class="s">Act</div>
+          <div class="n" id="m-act">—</div>
+          <div class="w">Verdict logged on this Mac</div>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <footer class="deck">
+    <div class="controls">
+      <button class="btn rec" id="rec" aria-pressed="false">State the standard</button>
+      <input type="text" id="typed" placeholder="Or type it: every box must have a label facing up">
+      <button class="btn" id="save">Set standard</button>
+      <button class="btn" id="clear">Clear session</button>
+    </div>
+    <div class="historywrap">
+      <div class="k" id="histk">No verdicts yet</div>
+      <div class="history" id="history"></div>
+    </div>
+    <div class="notice" id="notice"></div>
+  </footer>
+
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const SIGNAL = {pass:'var(--pass)', fail:'var(--fail)', unclear:'var(--wait)'};
+
+fetch('/api/config').then(r=>r.json()).then(c=>{ $('insight').href = c.insight_url; })
+  .catch(()=>{});
+
+function fmtMs(ms){
+  if (ms == null || !isFinite(ms)) return '—';
+  return ms >= 1000 ? (ms/1000).toFixed(2)+' s' : Math.round(ms)+' ms';
+}
+
+function render(s){
+  // --- connection ---
+  $('dot').className = 'dot ' + (s.connected ? 'up' : 'down');
+  $('health').textContent = s.connected ? 'Modalix connected' : 'Modalix unreachable';
+  $('notice').textContent = (!s.connected && s.last_error) ? s.last_error : '';
+
+  // --- standard ---
+  const std = $('standard');
+  std.textContent = s.standard || 'No standard set';
+  std.classList.toggle('none', !s.standard);
+
+  // --- tallies ---
+  $('n-pass').textContent  = s.counters.passed;
+  $('n-fail').textContent  = s.counters.failed;
+  $('n-total').textContent = s.counters.total;
+
+  // --- the andon slab ---
+  const latest = s.recent[0] || null;
+  const verdict = $('verdict'), reason = $('reason'), against = $('against');
+  const arming = $('arming');
+  let signal = 'var(--faint)';
+  against.textContent = '';
+
+  if (!s.connected){
+    verdict.textContent = 'Line down'; verdict.className = 'verdict small';
+    reason.textContent = 'The Modalix edge agent is not answering. Check the Ethernet link, then restart it with scripts/run-edge.sh.';
+    reason.className = 'reason quiet';
+    signal = 'var(--fail)';
+  } else if (!s.standard){
+    verdict.textContent = 'Set the standard'; verdict.className = 'verdict small';
+    reason.textContent = 'Press "State the standard" and say what a good item looks like. Whisper transcribes it on the DevKit.';
+    reason.className = 'reason quiet';
+  } else if (s.inspecting){
+    verdict.textContent = 'Judging'; verdict.className = 'verdict small';
+    reason.textContent = 'The vision-language model is reading this item against your standard.';
+    reason.className = 'reason quiet';
+    signal = 'var(--wait)';
+  } else if (latest){
+    verdict.textContent = latest.verdict; verdict.className = 'verdict';
+    reason.textContent = latest.reason || 'No reason returned.';
+    reason.className = 'reason';
+    signal = SIGNAL[latest.verdict] || 'var(--faint)';
+    against.innerHTML = 'Judged against <b>' + escapeHtml(latest.standard) + '</b>';
+  } else if (s.gate_state === 'settling'){
+    verdict.textContent = 'Hold still'; verdict.className = 'verdict small';
+    reason.textContent = 'Waiting for the item to settle before spending an inference.';
+    reason.className = 'reason quiet';
+    signal = 'var(--wait)';
+  } else {
+    verdict.textContent = 'Ready'; verdict.className = 'verdict small';
+    reason.textContent = 'Place an item in view of the camera.';
+    reason.className = 'reason quiet';
+  }
+  $('slab').style.setProperty('--signal', signal);
+  arming.style.width = (s.gate_state === 'settling' ? s.gate_progress*100 : 0) + '%';
+
+  // --- evidence ---
+  const frame = $('frame');
+  if (latest && latest.evidence_path){
+    const src = '/api/evidence/' + latest.evidence_path.replace('evidence/','');
+    if (frame.dataset.src !== src){
+      frame.dataset.src = src;
+      frame.innerHTML = '<img alt="Frame judged by the vision-language model">';
+      frame.firstChild.src = src;
+    }
+    $('evtime').textContent = new Date(latest.ts*1000).toLocaleTimeString();
+  }
+
+  // --- the three-stage chain, measured ---
+  $('m-see').textContent = s.connected ? (s.fps ? s.fps.toFixed(0)+' fps' : '—') : '—';
+  $('m-understand').textContent = latest ? fmtMs(latest.metrics.inference_ms) : '—';
+  $('m-act').textContent = latest ? fmtMs(latest.metrics.end_to_end_ms) : '—';
+
+  // --- history ---
+  $('histk').textContent = s.counters.total
+    ? 'Recent verdicts, newest first' : 'No verdicts yet';
+  $('history').innerHTML = s.recent.slice(0,40)
+    .map(r => '<div class="tile '+r.verdict+'" title="'+escapeHtml(r.verdict+': '+r.reason)+'"></div>').join('');
+}
+
+function escapeHtml(s){
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+// --- live state ---
+let es;
+function connect(){
+  es = new EventSource('/api/stream');
+  es.onmessage = e => { try { render(JSON.parse(e.data)); } catch(_){} };
+  es.onerror = () => { es.close(); setTimeout(connect, 2000); };
+}
+connect();
+
+// --- setting the standard ---
+async function setStandard(text){
+  const r = await fetch('/api/standard', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({text})
+  });
+  if (!r.ok) $('notice').textContent = 'Could not set the standard: ' + await r.text();
+}
+$('save').onclick = () => { const v = $('typed').value.trim(); if (v) setStandard(v); };
+$('typed').onkeydown = e => { if (e.key === 'Enter') $('save').click(); };
+$('clear').onclick = () => fetch('/api/session/clear', {method:'POST'});
+
+let recorder, chunks = [];
+$('rec').onclick = async () => {
+  const btn = $('rec');
+  if (recorder && recorder.state === 'recording'){
+    recorder.stop();
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({audio:true});
+    recorder = new MediaRecorder(stream);
+    chunks = [];
+    recorder.ondataavailable = e => chunks.push(e.data);
+    recorder.onstop = async () => {
+      stream.getTracks().forEach(t => t.stop());
+      btn.setAttribute('aria-pressed','false');
+      btn.textContent = 'Transcribing on Modalix';
+      btn.disabled = true;
+      const fd = new FormData();
+      fd.append('file', new Blob(chunks, {type:'audio/webm'}), 'speech.webm');
+      try {
+        const r = await fetch('/api/standard/speak', {method:'POST', body:fd});
+        if (!r.ok) $('notice').textContent = 'Speech not accepted: ' + await r.text();
+      } catch (err){
+        $('notice').textContent = 'Could not reach the DevKit for transcription.';
+      }
+      btn.disabled = false;
+      btn.textContent = 'State the standard';
+    };
+    recorder.start();
+    btn.setAttribute('aria-pressed','true');
+    btn.textContent = 'Stop and transcribe';
+    $('notice').textContent = '';
+  } catch (err){
+    $('notice').textContent = 'No microphone access. Type the standard instead.';
+  }
+};
+</script>
+</body>
+</html>

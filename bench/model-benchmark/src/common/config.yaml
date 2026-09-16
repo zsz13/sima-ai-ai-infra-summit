@@ -1,0 +1,8 @@
+model:                       # Model package selection.
+  path: /media/nvme/foreman/models/yolo_26n_mpk.tar.gz         # Example: models/<model-pack>.tar.gz
+
+benchmark:                   # Synthetic benchmark settings.
+  frames: 2000               # Number of synthetic frames to run.
+
+output:                      # Benchmark report output.
+  report_json: sandbox/model-benchmark/report.json # JSON report path.

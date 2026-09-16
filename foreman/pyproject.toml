@@ -1,0 +1,44 @@
+[project]
+name = "foreman"
+version = "0.1.0"
+description = "Spoken-spec zero-shot inspection on SiMa.ai Modalix"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn>=0.32",
+    "httpx>=0.27",
+    "python-multipart>=0.0.9",
+]
+
+# The edge agent (edge/foreman_edge.py) deliberately has NO dependencies beyond
+# the standard library plus what the DevKit's PyNeat environment already
+# provides (pyneat, numpy, cv2). Nothing here is installed on the board.
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "anyio>=4.6",
+    "pillow>=11.0",   # test harness only, for placeholder evidence frames
+    "ruff>=0.8",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "C4", "RET", "PTH"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402"]
+"edge/*" = ["PTH123"]   # stdlib-only on the board; no pathlib dependency wanted
+
+[tool.pyright]
+include = ["host", "tests"]
+exclude = ["edge"]       # board-only modules cannot resolve on a dev host
+pythonVersion = "3.11"

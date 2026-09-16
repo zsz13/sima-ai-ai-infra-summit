@@ -1,0 +1,31 @@
+- generic [active] [ref=f2e1]:
+  - generic [ref=f2e2]:
+    - generic [ref=f2e3]:
+      - generic [ref=f2e4]: "Videos Per Page:"
+      - generic [ref=f2e5]:
+        - button "1" [ref=f2e6] [cursor=pointer]
+        - button "4" [ref=f2e7] [cursor=pointer]
+        - button "9" [ref=f2e8] [cursor=pointer]
+        - button "16" [ref=f2e9] [cursor=pointer]
+        - button "24" [ref=f2e10] [cursor=pointer]
+        - button "36" [ref=f2e11] [cursor=pointer]
+        - button "48" [ref=f2e12] [cursor=pointer]
+      - generic [ref=f2e13]:
+        - button "Prev" [disabled] [ref=f2e14]
+        - generic [ref=f2e15]: Page 1 of 1
+        - button "Next" [disabled] [ref=f2e16]
+        - generic [ref=f2e17]:
+          - generic [ref=f2e18]: Go to
+          - textbox "Go to page" [ref=f2e19]: "1"
+        - generic [ref=f2e20]:
+          - generic [ref=f2e21]: Channel
+          - textbox "Go to channel" [ref=f2e22]:
+            - /placeholder: 0-79
+    - generic [ref=f2e24]:
+      - generic: No active video received
+      - generic [ref=f2e26]:
+        - generic [ref=f2e27]: Channel 0
+        - button [ref=f2e28] [cursor=pointer]:
+          - img "Settings" [ref=f2e29]
+  - button [ref=f2e30] [cursor=pointer]:
+    - img "Settings Menu" [ref=f2e31]

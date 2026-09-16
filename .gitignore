@@ -1,0 +1,20 @@
+# SDK runtime state and credentials - never commit
+.ghcr.io-*/
+.insight-media/
+
+# Large model artifacts (1GB+); re-fetch with setup-devkit.sh
+models/
+
+# Media assets
+assets/videos/*.mp4
+
+# Python envs and caches
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# Runtime output
+foreman/audit/
+bench/*/sandbox/
