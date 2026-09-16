@@ -1,6 +1,8 @@
 # Hackathon Status
 
-_Last updated: full pipeline working end to end on real Modalix hardware._
+_Last updated: temporal grounding + ROI inspection + Camera Check, verified on hardware._
+
+**Resuming after a context reset? Read `docs/SESSION_HANDOFF.md` first.**
 
 # Objective
 
@@ -53,7 +55,10 @@ Every inference is on Modalix. The Mac does gating, policy, audit and UI.
 | **VLM on the MLA** | correct, discriminating verdicts with grounded reasons, 1368 ms median |
 | **Full Foreman loop** | gate fires -> VLM judges -> verdict + evidence + audit, 1875 ms end to end |
 | Speech -> standard | browser audio -> Mac -> DevKit Whisper -> standard set, 289 ms round trip |
-| Host test suite | 67 tests pass, `ruff check` clean |
+| Host test suite | **148 tests pass**, `ruff check` clean |
+| Temporal grounding | hallucinated object -> FAIL via `detector-absent`, verified live |
+| ROI attribute inspection | close-ups of the smallest required object, 4 images/judgement |
+| Camera check mode | live boxes + class list, pauses inspections, creates no records |
 
 Screenshots: `foreman/docs/ui-live.png` (product console, live verdict),
 `foreman/docs/insight-overlay.png` (Insight with DevKit boxes).
@@ -70,7 +75,16 @@ Screenshots: `foreman/docs/ui-live.png` (product console, live verdict),
 
 # In Progress
 
-Nothing blocking. Remaining optional work is listed under *Next 3 Actions*.
+Nothing blocking.
+
+## Recent work (this session)
+
+| Item | Outcome |
+|---|---|
+| Evidence images looked cropped | **Frontend only.** Source JPEGs were always full 1280x720. Cells were 3.21:1 with `place-items:center` + `height:100%` + `overflow:hidden`, so the `<img>` overflowed and was clipped. Now a responsive 3-column true-16:9 grid with click-to-enlarge. |
+| "Duplicate" person box | **Not a duplicate.** Cropping the stored evidence showed a genuinely different person - curly hair, headphones - behind the subject, at containment 0.65. The detector was right. Conservative nested-box suppression added anyway (containment >= 0.92, area ratio <= 0.12) with a regression test that this real person is never merged away. |
+| ROI attribute inspection | Generic: the detector grounds the parent object, the smallest required object is cropped with 25% padding and enlarged, and close-ups are sent alongside wide shots. No per-object rules. |
+| Camera check | Live detector view with boxes, class list, fps and threshold. Pauses inspections; no VLM call, no records, standard untouched. |
 
 # Blockers
 
@@ -186,8 +200,12 @@ unreachable" rather than a stale verdict when the edge is down.
 
 # Next 3 Actions
 
-1. **Measure board power** with `benchmarking/model-benchmark` so the "edge AI at
-   low power" claim is ours, not the vendor's.
-2. **Update `demo.sh` for the rsync topology** and rehearse it cold from
-   `stop.sh` to a live verdict, so the one-command path is proven, not assumed.
-3. **Rehearse the pitch** against `docs/PITCH.md`, including the failure drills.
+1. **Physical validation with props** - person holding a phone (PASS), phone on
+   the desk not held (FAIL), bottle in view, bottle with and without a cap, and a
+   short occlusion. These are the last unverified parts of the temporal pipeline
+   and they need someone in front of the camera.
+2. **Make the standard parser handle Russian.** A Russian standard currently
+   parses to zero objects, so detector grounding is silently skipped and the
+   verdict falls back to the model alone - the exact failure mode temporal
+   grounding exists to prevent.
+3. **Rehearse the pitch** against `foreman/docs/PITCH.md`, including the failure drills.

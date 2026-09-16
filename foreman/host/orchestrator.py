@@ -85,6 +85,9 @@ class Orchestrator:
     last_error: str | None = None
     frames_seen: int = 0
     warming_up: bool = False
+    #: Camera Check mode. The detector keeps running and the live view keeps
+    #: updating, but no inspection is triggered: no VLM call, no PASS/FAIL record.
+    paused: bool = False
     detections_last_frame: int = 0
     fps: float = 0.0
     inspecting: bool = False
@@ -156,6 +159,7 @@ class Orchestrator:
             "gate_progress": round(self._gate.progress, 3),
             "inspecting": self.inspecting,
             "warming_up": self.warming_up,
+            "paused": self.paused,
             "window_frames": sum(1 for ts, _ in self._ring
                                  if self._ring and ts >= self._ring[-1][0] - self.window_s),
             "frames_seen": self.frames_seen,
@@ -180,6 +184,32 @@ class Orchestrator:
         self.recent.clear()
         self._gate.reset()
         self._publish()
+
+    def live(self) -> dict:
+        """Raw detector output for Camera Check. Never triggers inference."""
+        ts, dets = (self._ring[-1] if self._ring else (0.0, []))
+        counts: dict[str, int] = {}
+        best: dict[str, float] = {}
+        for d in dets:
+            label = d["label"]
+            counts[label] = counts.get(label, 0) + 1
+            best[label] = max(best.get(label, 0.0), float(d.get("confidence", 0.0)))
+        return {
+            "ts": ts,
+            "age_s": round(time.time() - ts, 2) if ts else None,
+            "fps": round(self.fps, 1),
+            "connected": self.connected,
+            "paused": self.paused,
+            "min_confidence": self.grounding.min_confidence,
+            "gate_min_confidence": self.gate_config.min_confidence,
+            "detections": dets,
+            "classes": sorted(
+                ({"label": k, "count": counts[k], "confidence": round(best[k], 3)}
+                 for k in counts),
+                key=lambda c: (-c["confidence"], c["label"])),
+            "window_frames": sum(1 for t, _ in self._ring
+                                 if self._ring and t >= self._ring[-1][0] - self.window_s),
+        }
 
     def reset(self) -> None:
         """Drop buffered evidence too, e.g. when the camera source changes."""
@@ -244,7 +274,7 @@ class Orchestrator:
 
         should_inspect = self._gate.update(frame.detections)
 
-        if should_inspect and self.standard and not self.inspecting:
+        if should_inspect and self.standard and not self.inspecting and not self.paused:
             if self.temporal and not self._window_ready():
                 # The gate settled before the evidence window had filled - which
                 # happens on the first item after connecting or after a new

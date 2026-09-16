@@ -217,7 +217,8 @@ class GenAI:
         return verdict, reason, metrics
 
     def judge_window(self, jpegs: list[bytes], standard: str,
-                     detector_summary: str) -> tuple[dict, dict]:
+                     detector_summary: str, roi_label: str | None = None,
+                     roi_count: int = 0) -> tuple[dict, dict]:
         """Judge a short evidence window from several frames in ONE request.
 
         Multi-image support was verified on this hardware: three images in one
@@ -230,9 +231,20 @@ class GenAI:
         constraint is enforced on the Mac, in host/policy.py, not here.
         """
         n = len(jpegs)
+        if roi_label and roi_count:
+            wide = n - roi_count
+            layout = (
+                f"You are shown {n} images from about three seconds of video. "
+                f"The first {wide} show the whole scene, in time order. "
+                f"The remaining {roi_count} are close-up crops of the {roi_label} "
+                f"from the same window, enlarged so you can see detail. "
+                f"Use the close-ups to judge small features, and the wide shots for "
+                f"context and relationships.\n\n")
+        else:
+            layout = (f"You are shown {n} still frames captured over about three "
+                      "seconds, in time order.\n\n")
         prompt = (
-            "You are a careful visual inspection system. You are shown "
-            f"{n} still frames captured over about three seconds, in time order.\n\n"
+            "You are a careful visual inspection system. " + layout +
             f"REQUIREMENT: {standard}\n\n"
             f"DETECTOR EVIDENCE (measured, not your opinion):\n{detector_summary}\n\n"
             "Rules you must follow:\n"
@@ -387,7 +399,12 @@ def parse_window_judgement(text: str, frames_sent: int) -> dict:
                 out.append(text)
         return out[:4]
 
-    reason = _clean_text(obj.get("reason"), "No reason given.")
+    reason = _clean_text(obj.get("reason"), "")
+    if not reason:
+        # The model sometimes omits the sentence but still lists what it saw.
+        # Reuse that rather than showing an empty explanation next to a verdict.
+        ev = strlist("evidence")
+        reason = (ev[0][0].upper() + ev[0][1:]) if ev else "No reason given."
     if contradiction:
         reason = f"The model contradicted itself, so this needs a human. {reason}"
 
@@ -459,6 +476,72 @@ def encode_multipart(fields: dict, file_field: str, filename: str, content: byte
 
 
 # ----------------------------------------------------------- detection
+
+def box_iou(a, b) -> float:
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    iw, ih = ix2 - ix1, iy2 - iy1
+    if iw <= 0 or ih <= 0:
+        return 0.0
+    inter = iw * ih
+    aa = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+    ab = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+    union = aa + ab - inter
+    return inter / union if union > 0 else 0.0
+
+
+def box_containment(a, b) -> float:
+    """Fraction of the SMALLER box that lies inside the larger one."""
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    iw, ih = ix2 - ix1, iy2 - iy1
+    if iw <= 0 or ih <= 0:
+        return 0.0
+    aa = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+    ab = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+    smaller = min(aa, ab)
+    return (iw * ih) / smaller if smaller > 0 else 0.0
+
+
+def suppress_nested_duplicates(detections, containment_min=0.92, area_ratio_max=0.12):
+    """Drop a small same-class box almost entirely swallowed by a much larger one.
+
+    On-device NMS uses IoU, which is structurally blind to nesting: a box that is
+    95% inside a box ten times its size still scores a low IoU, because the union
+    is dominated by the large box. Measured here: same-class nested pairs appeared
+    in ~2.7% of frames (10 pairs over 375 frames) with IoU 0.05-0.10 but
+    containment 0.73-0.97, so the 0.45 IoU threshold never touched them.
+
+    The thresholds are deliberately strict. A second person standing behind the
+    main subject was verified by eye in this scene at containment 0.65 with an
+    area ratio of 0.013 - a real person, not a duplicate - so containment alone
+    is NOT sufficient evidence. Requiring containment >= 0.92 keeps that case,
+    and every other genuinely separate person observed, intact.
+
+    Only the lower-confidence box of a suppressed pair is dropped, and only
+    within the same class: two different classes may legitimately nest
+    (a cell phone inside a person).
+    """
+    keep = []
+    for det in sorted(detections, key=lambda d: -float(d.get("confidence", 0.0))):
+        box = det["bbox"]
+        area = max(0.0, box[2] - box[0]) * max(0.0, box[3] - box[1])
+        swallowed = False
+        for kept in keep:
+            if kept["label"] != det["label"]:
+                continue
+            kbox = kept["bbox"]
+            karea = max(0.0, kbox[2] - kbox[0]) * max(0.0, kbox[3] - kbox[1])
+            if karea <= 0 or area > karea:
+                continue
+            if (box_containment(box, kbox) >= containment_min
+                    and (area / karea) <= area_ratio_max):
+                swallowed = True
+                break
+        if not swallowed:
+            keep.append(det)
+    return keep
+
 
 def parse_boxes(payload: bytes, img_w: int, img_h: int) -> list[dict]:
     """Decode Neat's BBOX tensor payload: uint32 count, then (x,y,w,h,score,class)."""
@@ -590,6 +673,88 @@ def frame_to_jpeg(tensor, quality: int) -> bytes | None:
         return buf.tobytes() if ok else None
     except Exception as exc:
         print(f"[foreman-edge] frame encode failed: {exc}", file=sys.stderr, flush=True)
+        return None
+
+
+def pick_roi_class(frames, required):
+    """Choose which required object is worth zooming into.
+
+    The smallest one, by median area across the window. The detector grounds the
+    parent object; the details that decide a verdict - a cap, a label, glasses, a
+    hand gripping a phone - are usually a small part of it, and are the first
+    thing lost when a 1280x720 frame is resized for the vision encoder. Picking
+    the smallest required object is generic: it needs no per-object rules and no
+    list of attributes.
+    """
+    best, best_area = None, None
+    for label in required:
+        areas = []
+        for f in frames:
+            for d in f.detections:
+                if d.get("label") == label:
+                    b = d["bbox"]
+                    areas.append(max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1]))
+        if not areas:
+            continue
+        areas.sort()
+        median = areas[len(areas) // 2]
+        if best_area is None or median < best_area:
+            best, best_area = label, median
+    return best, (best_area or 0.0)
+
+
+def stable_bbox(frames, label):
+    """Median bbox for a class across the window, resistant to a single bad frame."""
+    xs1, ys1, xs2, ys2 = [], [], [], []
+    for f in frames:
+        best, bbox = 0.0, None
+        for d in f.detections:
+            if d.get("label") == label and float(d.get("confidence", 0)) > best:
+                best, bbox = float(d["confidence"]), d["bbox"]
+        if bbox:
+            xs1.append(bbox[0])
+            ys1.append(bbox[1])
+            xs2.append(bbox[2])
+            ys2.append(bbox[3])
+    if not xs1:
+        return None
+    def med(values):
+        return sorted(values)[len(values) // 2]
+
+    return (med(xs1), med(ys1), med(xs2), med(ys2))
+
+
+def crop_roi(jpeg: bytes, bbox, pad: float = 0.25, min_side: int = 224) -> bytes | None:
+    """Crop a padded region of interest and return it as JPEG.
+
+    Padding keeps context around the object - a cap is only meaningful relative to
+    the bottle neck it sits on. Very small crops are upscaled to `min_side` so the
+    vision encoder receives usable detail instead of a handful of pixels.
+    """
+    try:
+        arr = np.frombuffer(jpeg, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is None:
+            return None
+        h, w = img.shape[:2]
+        x1, y1, x2, y2 = bbox
+        bw, bh = (x2 - x1) * w, (y2 - y1) * h
+        px, py = bw * pad, bh * pad
+        cx1 = max(0, int(x1 * w - px))
+        cy1 = max(0, int(y1 * h - py))
+        cx2 = min(w, int(x2 * w + px))
+        cy2 = min(h, int(y2 * h + py))
+        if cx2 - cx1 < 8 or cy2 - cy1 < 8:
+            return None
+        roi = img[cy1:cy2, cx1:cx2]
+        side = min(roi.shape[0], roi.shape[1])
+        if side < min_side:
+            scale = min_side / side
+            roi = cv2.resize(roi, (int(roi.shape[1] * scale), int(roi.shape[0] * scale)),
+                             interpolation=cv2.INTER_CUBIC)
+        ok, buf = cv2.imencode(".jpg", roi, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
+        return buf.tobytes() if ok else None
+    except Exception:
         return None
 
 
@@ -825,6 +990,11 @@ class Pipeline:
                     "track_id": None,
                     "_px": [b["x1"], b["y1"], b["x2"] - b["x1"], b["y2"] - b["y1"]],
                 } for b in boxes]
+                if self.args.suppress_nested:
+                    detections = suppress_nested_duplicates(
+                        detections,
+                        containment_min=self.args.nested_containment,
+                        area_ratio_max=self.args.nested_area_ratio)
             except Exception as exc:
                 print(f"[foreman-edge] box decode failed: {exc}", file=sys.stderr, flush=True)
 
@@ -1023,9 +1193,44 @@ def make_handler(genai: GenAI, args):
             selection_ms = (time.monotonic() - t_sel) * 1000.0
 
             summary = detector_summary(frames, required, prohibited)
+
+            # Generic attribute inspection: the detector grounds the parent
+            # object, and a padded close-up of it gives the model the detail it
+            # needs for sub-parts it has no class for (a cap, a label, glasses).
+            roi_label, roi_images, roi_meta = None, [], []
+            if required and args.roi_enabled:
+                roi_label, _ = pick_roi_class(frames, required)
+            if roi_label:
+                fallback = stable_bbox(frames, roi_label)
+                for f in selected:
+                    bbox = None
+                    best = 0.0
+                    for det in f.detections:
+                        if det.get("label") == roi_label and float(det.get("confidence", 0)) > best:
+                            best, bbox = float(det["confidence"]), det["bbox"]
+                    bbox = bbox or fallback
+                    if not bbox:
+                        continue
+                    crop = crop_roi(f.jpeg, bbox, pad=args.roi_pad)
+                    if crop:
+                        roi_images.append(crop)
+                        roi_meta.append({"frame_id": f.frame_id,
+                                         "rel_ts": round(f.ts - frames[0].ts, 3),
+                                         "label": roi_label,
+                                         "bbox": [round(v, 4) for v in bbox],
+                                         "bytes": len(crop)})
+                roi_images = roi_images[:args.roi_frames]
+                roi_meta = roi_meta[:args.roi_frames]
+
+            wide = [f.jpeg for f in selected]
+            if roi_images:
+                # Keep total images bounded: fewer wide shots when ROI crops are added.
+                wide = wide[:max(1, args.evidence_frames - len(roi_images) + 1)]
             try:
                 judgement, metrics = genai.judge_window(
-                    [f.jpeg for f in selected], standard, summary)
+                    wide + roi_images, standard, summary,
+                    roi_label=roi_label if roi_images else None,
+                    roi_count=len(roi_images))
             except (urllib.error.URLError, OSError, ValueError) as exc:
                 return self._json(502, {"error": f"vision-language model unavailable: {exc}"})
 
@@ -1040,6 +1245,7 @@ def make_handler(genai: GenAI, args):
                     "image_frames": sum(1 for f in frames if f.jpeg is not None),
                 },
                 "detector_summary": summary,
+                "roi": {"label": roi_label, "frames": roi_meta} if roi_images else None,
                 "selected": [{
                     "frame_id": f.frame_id,
                     "ts": f.ts,
@@ -1152,6 +1358,18 @@ def parse_args(argv=None):
                    choices=["h264", "h265", "mjpeg"])
     p.add_argument("--latency-ms", type=int, default=200)
     p.add_argument("--jpeg-every", type=int, default=3, help="keep 1 in N frames as JPEG")
+    p.add_argument("--no-suppress-nested", dest="suppress_nested", action="store_false",
+                   help="disable nested duplicate-box suppression")
+    p.add_argument("--nested-containment", type=float, default=0.92,
+                   help="min containment for a nested box to be suppressed")
+    p.add_argument("--nested-area-ratio", type=float, default=0.12,
+                   help="max small/large area ratio for nested suppression")
+    p.add_argument("--no-roi", dest="roi_enabled", action="store_false",
+                   help="disable region-of-interest attribute inspection")
+    p.add_argument("--roi-frames", type=int, default=int(env("FOREMAN_ROI_FRAMES", "2")),
+                   help="ROI close-ups added to a judgement")
+    p.add_argument("--roi-pad", type=float, default=0.25,
+                   help="padding around the ROI, as a fraction of the box")
     p.add_argument("--window-s", type=float, default=float(env("FOREMAN_WINDOW_S", "3.0")),
                    help="rolling evidence window in seconds")
     p.add_argument("--evidence-frames", type=int, default=int(env("FOREMAN_EVIDENCE_FRAMES", "3")),

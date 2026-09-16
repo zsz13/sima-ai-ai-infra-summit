@@ -23,8 +23,9 @@ import json
 import os
 from pathlib import Path
 
+import httpx
 import uvicorn
-from fastapi import FastAPI, HTTPException, UploadFile
+from fastapi import FastAPI, HTTPException, Response, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -143,6 +144,39 @@ async def set_standard_from_speech(file: UploadFile) -> dict:
     }
 
 
+@app.get("/api/live")
+async def live() -> dict:
+    """Raw detector output for Camera Check. Read-only; triggers no inference."""
+    return orchestrator.live()
+
+
+@app.get("/api/live/frame.jpg")
+async def live_frame() -> Response:
+    """Proxy the DevKit's latest decoded frame, so the browser needs no route to it."""
+    try:
+        r = await orchestrator.edge._client.get("/frame.jpg", timeout=5.0)
+        r.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise HTTPException(503, f"no live frame: {exc}") from exc
+    return Response(content=r.content, media_type="image/jpeg",
+                    headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/mode")
+async def set_mode(body: dict) -> dict:
+    """Enter or leave Camera Check.
+
+    Camera Check pauses inspections only. The detector keeps running on the
+    DevKit, the live view keeps updating, and the current standard is left
+    untouched - it is a debugging view, not a state change.
+    """
+    camera = bool((body or {}).get("camera"))
+    orchestrator.paused = camera
+    orchestrator._publish()
+    return {"camera": camera, "paused": orchestrator.paused,
+            "standard": orchestrator.standard}
+
+
 @app.post("/api/session/clear")
 async def clear_session() -> dict:
     orchestrator.clear_session()
@@ -160,8 +194,23 @@ async def evidence(name: str) -> FileResponse:
     return FileResponse(path, media_type="image/jpeg")
 
 
+class NoCacheStatic(StaticFiles):
+    """Serve the console with no-store.
+
+    A cached index.html silently hid a CSS fix during development; the same class
+    of problem bites Neat Insight's viewer. The console is a handful of KB, so
+    revalidating every load costs nothing and removes a whole category of
+    "why is my change not showing" during a demo.
+    """
+
+    def file_response(self, *args, **kwargs):
+        resp = super().file_response(*args, **kwargs)
+        resp.headers["Cache-Control"] = "no-store, must-revalidate"
+        return resp
+
+
 if FRONTEND.is_dir():
-    app.mount("/", StaticFiles(directory=FRONTEND, html=True), name="frontend")
+    app.mount("/", NoCacheStatic(directory=FRONTEND, html=True), name="frontend")
 
 
 def main() -> None:

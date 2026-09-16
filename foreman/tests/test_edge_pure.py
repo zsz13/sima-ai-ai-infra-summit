@@ -339,3 +339,170 @@ def test_selection_handles_a_window_smaller_than_the_request():
 
 def test_selection_of_zero_frames_is_empty():
     assert fe.select_representative(_window(), [], 0) == []
+
+
+# --- nested duplicate suppression --------------------------------------
+#
+# Root cause context: on-device NMS uses IoU, which cannot see nesting. A box
+# 95% inside a box ten times its size still has a low IoU because the union is
+# dominated by the large box. Measured on hardware: 10 same-class nested pairs
+# over 375 frames, IoU 0.05-0.10, containment 0.73-0.97.
+#
+# The real bottom-left "duplicate" in this venue was verified by eye to be a
+# SECOND PERSON (containment 0.65, area ratio 0.013). The thresholds must spare it.
+
+def d(label, bbox, conf=0.7):
+    return {"label": label, "confidence": conf, "bbox": list(bbox)}
+
+
+def test_nested_small_box_inside_a_much_larger_one_is_suppressed():
+    big = d("person", (0.10, 0.10, 0.90, 0.95), 0.69)
+    tiny = d("person", (0.40, 0.20, 0.50, 0.35), 0.58)   # fully inside, ~2% of area
+    out = fe.suppress_nested_duplicates([big, tiny])
+    assert len(out) == 1
+    assert out[0]["confidence"] == 0.69, "the higher-confidence box must survive"
+
+
+def test_two_genuinely_separate_people_are_both_kept():
+    a = d("person", (0.05, 0.10, 0.45, 0.95), 0.69)
+    b = d("person", (0.55, 0.10, 0.95, 0.95), 0.66)
+    assert len(fe.suppress_nested_duplicates([a, b])) == 2
+
+
+def test_the_verified_real_background_person_is_not_suppressed():
+    """Regression from real hardware.
+
+    Stored evidence frame audit/evidence/1789519179373-4.jpg contained two person
+    boxes: the main subject filling the frame, and a small box at the bottom left.
+    Cropping and enlarging that box showed a genuinely different person - curly
+    hair, headphones - sitting behind the subject. Measured containment 0.65 at an
+    area ratio of 0.011. If the containment threshold ever drops near 0.65, this
+    real person gets deleted.
+    """
+    main = d("person", (0.125, 0.02, 0.98, 0.99), 0.69)     # containment 0.66
+    background = d("person", (0.102, 0.882, 0.183, 0.999), 0.59)
+    assert fe.box_containment(background["bbox"], main["bbox"]) == pytest.approx(0.66, abs=0.02)
+    out = fe.suppress_nested_duplicates([main, background])
+    assert len(out) == 2, "a real second person must never be merged away"
+
+
+def test_partially_overlapping_people_are_both_kept():
+    a = d("person", (0.10, 0.10, 0.60, 0.95), 0.69)
+    b = d("person", (0.45, 0.15, 0.95, 0.95), 0.64)   # big overlap, similar size
+    assert len(fe.suppress_nested_duplicates([a, b])) == 2
+
+
+def test_different_classes_may_legitimately_nest():
+    person = d("person", (0.10, 0.05, 0.90, 0.99), 0.69)
+    phone = d("cell phone", (0.40, 0.55, 0.52, 0.70), 0.61)
+    assert len(fe.suppress_nested_duplicates([person, phone])) == 2
+
+
+def test_a_nested_box_just_below_the_containment_threshold_is_kept():
+    big = d("person", (0.0, 0.0, 1.0, 1.0), 0.69)
+    # half of the small box hangs outside the large one
+    edge = d("person", (0.90, 0.40, 1.10, 0.50), 0.60)
+    assert len(fe.suppress_nested_duplicates([big, edge])) == 2
+
+
+def test_a_nested_box_too_large_relative_to_the_parent_is_kept():
+    big = d("person", (0.0, 0.0, 1.0, 1.0), 0.69)
+    half = d("person", (0.2, 0.2, 0.8, 0.8), 0.60)   # 36% of the parent
+    assert len(fe.suppress_nested_duplicates([half, big])) == 2
+
+
+def test_suppression_is_order_independent():
+    big = d("person", (0.10, 0.10, 0.90, 0.95), 0.69)
+    tiny = d("person", (0.40, 0.20, 0.50, 0.35), 0.58)
+    assert len(fe.suppress_nested_duplicates([tiny, big])) == 1
+    assert len(fe.suppress_nested_duplicates([big, tiny])) == 1
+
+
+def test_empty_and_single_detection_lists_are_unchanged():
+    assert fe.suppress_nested_duplicates([]) == []
+    assert len(fe.suppress_nested_duplicates([d("person", (0, 0, 1, 1))])) == 1
+
+
+def test_thresholds_are_configurable_and_the_defaults_are_what_protect_the_real_person():
+    main = d("person", (0.125, 0.02, 0.98, 0.99), 0.69)
+    background = d("person", (0.102, 0.882, 0.183, 0.999), 0.59)
+    # Reckless settings WOULD merge the verified real person, which is exactly
+    # why the defaults sit well above the 0.65 containment it exhibits.
+    reckless = fe.suppress_nested_duplicates([main, background],
+                                             containment_min=0.60, area_ratio_max=0.50)
+    assert len(reckless) == 1
+    assert len(fe.suppress_nested_duplicates([main, background])) == 2
+
+
+def test_iou_and_containment_differ_on_nested_boxes():
+    """The reason IoU-based NMS misses these."""
+    big = (0.0, 0.0, 1.0, 1.0)
+    small = (0.45, 0.45, 0.55, 0.55)
+    assert fe.box_iou(big, small) < 0.02
+    assert fe.box_containment(big, small) == pytest.approx(1.0)
+
+
+# --- ROI attribute inspection ------------------------------------------
+#
+# The detector has 80 COCO classes. `cap`, `label`, `glasses`, `goggles` and
+# `damage` are not among them, so the VLM must judge those - but at 1280x720
+# scaled down for the vision encoder, a bottle cap is a few pixels. ROI crops the
+# detector-grounded parent object and enlarges it.
+
+def _frame(dets, ts=0.0):
+    return _Rec(ts=ts, detections=dets)
+
+
+def test_roi_picks_the_smallest_required_object():
+    """For 'the person must hold a phone', zooming the phone is what helps."""
+    frames = [_frame([d("person", (0.1, 0.0, 0.9, 1.0)),
+                      d("cell phone", (0.45, 0.55, 0.55, 0.65))], ts=i * 0.2)
+              for i in range(10)]
+    label, area = fe.pick_roi_class(frames, ["person", "cell phone"])
+    assert label == "cell phone"
+    assert area < 0.02
+
+
+def test_roi_picks_the_bottle_when_it_is_the_only_required_object():
+    frames = [_frame([d("bottle", (0.4, 0.3, 0.5, 0.8))], ts=i * 0.2) for i in range(10)]
+    assert fe.pick_roi_class(frames, ["bottle"])[0] == "bottle"
+
+
+def test_roi_ignores_a_required_class_the_detector_never_saw():
+    frames = [_frame([d("person", (0.1, 0.0, 0.9, 1.0))], ts=i * 0.2) for i in range(10)]
+    assert fe.pick_roi_class(frames, ["person", "cell phone"])[0] == "person"
+
+
+def test_roi_returns_nothing_when_no_required_object_is_present():
+    frames = [_frame([], ts=i * 0.2) for i in range(5)]
+    assert fe.pick_roi_class(frames, ["bottle"])[0] is None
+
+
+def test_stable_bbox_is_the_median_not_a_single_frame():
+    frames = [_frame([d("bottle", (0.40, 0.30, 0.50, 0.80), 0.7)], ts=0.0),
+              _frame([d("bottle", (0.41, 0.31, 0.51, 0.81), 0.7)], ts=0.2),
+              _frame([d("bottle", (0.90, 0.90, 0.99, 0.99), 0.7)], ts=0.4)]  # one bad frame
+    box = fe.stable_bbox(frames, "bottle")
+    assert box[0] == pytest.approx(0.41, abs=0.01), "an outlier frame must not move the box"
+
+
+def test_stable_bbox_prefers_the_highest_confidence_box_in_each_frame():
+    frames = [_frame([d("bottle", (0.1, 0.1, 0.2, 0.2), 0.55),
+                      d("bottle", (0.6, 0.6, 0.7, 0.7), 0.68)], ts=0.0)]
+    assert fe.stable_bbox(frames, "bottle")[0] == pytest.approx(0.6)
+
+
+def test_stable_bbox_is_none_when_the_class_is_absent():
+    assert fe.stable_bbox([_frame([d("person", (0, 0, 1, 1))])], "bottle") is None
+
+
+def test_missing_reason_falls_back_to_the_evidence_list():
+    reply = ('{"meets_requirement":true,"verdict":"PASS","per_frame":[true,true,true],'
+             '"evidence":["a person is visible in every frame"]}')
+    j = fe.parse_window_judgement(reply, 3)
+    assert j["reason"] == "A person is visible in every frame"
+
+
+def test_missing_reason_and_evidence_says_so_plainly():
+    j = fe.parse_window_judgement('{"verdict":"PASS","per_frame":[true,true,true]}', 3)
+    assert j["reason"] == "No reason given."
