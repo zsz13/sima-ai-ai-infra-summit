@@ -1,20 +1,59 @@
-# SDK runtime state and credentials - never commit
+# ---------------------------------------------------------------------------
+# Secrets and SDK runtime state - never commit.
+# The Palette Neat SDK writes TLS certs and a tokenised VS Code Web URL here.
+# ---------------------------------------------------------------------------
 .ghcr.io-*/
 .insight-media/
+.env
+.env.*
+*.pem
+*.key
+*.p12
+id_rsa
+id_ed25519
+.sima-cli/
 
-# Large model artifacts (1GB+); re-fetch with setup-devkit.sh
+# ---------------------------------------------------------------------------
+# Large downloaded model artifacts (~1.1 GB).
+# Not in Git by design. Re-fetch with: DEVKIT_IP=<ip> ./foreman/scripts/setup-devkit.sh
+#   models/whisper-small-a16w8/   simaai/whisper-small-a16w8 from Hugging Face
+#   models/yolo_26n_mpk.tar.gz    SiMa Model Zoo gen2 (needs `sima-cli login`)
+# ---------------------------------------------------------------------------
 models/
 
-# Media assets
+# Demo video assets (re-downloadable; see foreman/docs/DEMO.md)
 assets/videos/*.mp4
 
-# Python envs and caches
-.venv/
-__pycache__/
-*.pyc
-.pytest_cache/
-.ruff_cache/
-
-# Runtime output
+# ---------------------------------------------------------------------------
+# Generated at runtime - inspection history, evidence frames, benchmark output.
+# Regenerated on every run; not source.
+# ---------------------------------------------------------------------------
 foreman/audit/
 bench/*/sandbox/
+*.log
+*.pid
+.playwright-mcp/
+
+# ---------------------------------------------------------------------------
+# Python environments and tooling caches
+# ---------------------------------------------------------------------------
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+
+# ---------------------------------------------------------------------------
+# Editor and OS noise (repo-local so the repo does not rely on a global ignore)
+# ---------------------------------------------------------------------------
+.DS_Store
+.idea/
+.vscode/
+*.iml
+*.swp
+*~
