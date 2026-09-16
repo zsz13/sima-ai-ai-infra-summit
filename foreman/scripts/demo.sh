@@ -29,7 +29,9 @@ cleanup() {
   for pid in "${PIDS[@]:-}"; do kill "$pid" 2>/dev/null; done
   pkill -f "[a]vfoundation" 2>/dev/null
   # Bracketed patterns so pkill does not match this ssh command line itself.
-  dev 'pkill -f "[f]oreman_edge.py"; pkill -f "[s]tart-genai"; pkill -f "[r]un-genai"' 2>/dev/null
+  dev 'for f in /tmp/foreman-edge.pid /tmp/foreman-genai.pid; do
+         [ -f "$f" ] && kill "$(cat "$f")" 2>/dev/null; rm -f "$f"; done
+       pkill -f "[f]oreman_edge.py"; pkill -f "[l]lima/models.*9998"' 2>/dev/null
   ok "stopped"
 }
 trap cleanup EXIT INT TERM
@@ -91,7 +93,8 @@ ok "source is ${SRC_W}x${SRC_H} @ ${SRC_FPS} fps on $SLOT"
 
 # ---------------------------------------------------------------- devkit
 step "GenAI server on the DevKit (vision-language + Whisper, on the MLA)"
-dev 'pkill -f "[s]tart-genai"; pkill -f "[r]un-genai"' 2>/dev/null; sleep 2
+dev 'if [ -f /tmp/foreman-genai.pid ]; then kill "$(cat /tmp/foreman-genai.pid)" 2>/dev/null; rm -f /tmp/foreman-genai.pid; fi
+     pkill -f "[l]lima/models.*9998"' 2>/dev/null; sleep 3
 ssh -n -f -o BatchMode=yes "$DEVKIT_USER@$DEVKIT_IP" \
   "cd $WS_REMOTE/foreman && nohup bash scripts/run-genai.sh > /tmp/foreman-genai.log 2>&1"
 say "loading models onto the MLA (about a minute)"
@@ -104,7 +107,8 @@ for i in $(seq 1 60); do
 done
 
 step "Edge agent on the DevKit (detector on the MLA)"
-dev 'pkill -f "[f]oreman_edge.py"' 2>/dev/null; sleep 2
+dev 'if [ -f /tmp/foreman-edge.pid ]; then kill "$(cat /tmp/foreman-edge.pid)" 2>/dev/null; rm -f /tmp/foreman-edge.pid; fi
+     pkill -f "[f]oreman_edge.py"' 2>/dev/null; sleep 2
 ssh -n -f -o BatchMode=yes "$DEVKIT_USER@$DEVKIT_IP" \
   "FOREMAN_SOURCE=rtsp://$HOST_IP:$RTSP_PORT/$SLOT \
    FOREMAN_MODEL='$FOREMAN_MODEL' \

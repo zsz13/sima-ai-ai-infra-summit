@@ -12,6 +12,16 @@ ASR_MODEL="${ASR_MODEL:-whisper-small-a16w8}"
 PORT="${GENAI_PORT:-9998}"
 PYNEAT="${PYNEAT:-$HOME/pyneat/bin/python3}"
 
+PIDFILE="${PIDFILE:-/tmp/foreman-genai.pid}"
+
+# Refuse to start a second server. The process ends up as `python3 -` (heredoc),
+# so a pattern like `pkill -f run-genai.sh` never matches it; three servers once
+# accumulated unnoticed and took CmaFree from 1.6 GB to 15 MB.
+if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+  echo "[genai] already running as PID $(cat "$PIDFILE"); not starting another." >&2
+  exit 0
+fi
+
 [ -x "$PYNEAT" ] || { echo "PyNeat interpreter not found at $PYNEAT" >&2; exit 1; }
 [ -d "$CATALOG/$VLM_MODEL" ] || { echo "missing VLM: $CATALOG/$VLM_MODEL" >&2; exit 1; }
 [ -d "$CATALOG/$ASR_MODEL" ] || { echo "missing ASR: $CATALOG/$ASR_MODEL" >&2; exit 1; }
@@ -26,6 +36,8 @@ echo "[genai] CmaFree after:  $(grep CmaFree /proc/meminfo | awk '"'"'{print $2"
 
 echo "[genai] serving vlm=$VLM_MODEL asr=$ASR_MODEL on :$PORT"
 
+echo $$ > "$PIDFILE"
+trap 'rm -f "$PIDFILE"' EXIT
 exec "$PYNEAT" - "$CATALOG/$VLM_MODEL" "$CATALOG/$ASR_MODEL" "$PORT" <<'PY'
 import signal, sys
 import pyneat

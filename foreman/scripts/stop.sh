@@ -16,10 +16,15 @@ pkill -f "[t]ests.fake_edge"  2>/dev/null
 
 step "DevKit processes"
 if ping -c 1 -W 2000 "$DEVKIT_IP" >/dev/null 2>&1; then
-  dev 'pkill -f "[f]oreman_edge.py"' 2>/dev/null
-  dev 'pkill -f "[s]tart-genai"; pkill -f "[r]un-genai"' 2>/dev/null
-  sleep 2
-  left=$(dev 'echo $(( $(pgrep -f "[f]oreman_edge.py" | wc -l) + $(pgrep -f "[r]un-genai" | wc -l) ))' 2>/dev/null)
+  # Stop by PID file first. The GenAI server runs as `python3 -` (a heredoc), so
+  # no pkill pattern based on the script name matches it - three copies once
+  # accumulated and took CmaFree from 1.6 GB to 15 MB. The pattern kills below
+  # are a backstop for processes started before PID files existed.
+  dev 'for f in /tmp/foreman-edge.pid /tmp/foreman-genai.pid; do
+         [ -f "$f" ] && kill "$(cat "$f")" 2>/dev/null; rm -f "$f"; done' 2>/dev/null
+  dev 'pkill -f "[f]oreman_edge.py"; pkill -f "[l]lima/models.*9998"' 2>/dev/null
+  sleep 3
+  left=$(dev 'echo $(( $(pgrep -f "[f]oreman_edge.py" | wc -l) + $(pgrep -f "[l]lima/models" | wc -l) ))' 2>/dev/null)
   if [ "${left:-0}" = "0" ]; then ok "edge agent and GenAI server stopped"
   else warn "$left DevKit process(es) still running"; fi
 else

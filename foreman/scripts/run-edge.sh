@@ -19,7 +19,15 @@ export FOREMAN_GENAI_URL="${FOREMAN_GENAI_URL:-http://127.0.0.1:9998}"
 export FOREMAN_EDGE_PORT="${FOREMAN_EDGE_PORT:-8100}"
 PYNEAT="${PYNEAT:-$HOME/pyneat/bin/python3}"
 
+PIDFILE="${PIDFILE:-/tmp/foreman-edge.pid}"
+if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+  echo "[edge] already running as PID $(cat "$PIDFILE"); not starting another." >&2
+  exit 0
+fi
+
 [ -x "$PYNEAT" ] || { echo "PyNeat interpreter not found at $PYNEAT" >&2; exit 1; }
 
 echo "[edge] workspace=$WS source=$FOREMAN_SOURCE insight=$FOREMAN_INSIGHT_HOST genai=$FOREMAN_GENAI_URL"
+echo $$ > "$PIDFILE"
+trap 'rm -f "$PIDFILE"' EXIT
 exec "$PYNEAT" "$WS/foreman/edge/foreman_edge.py" "$@"
