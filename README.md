@@ -16,7 +16,7 @@ redeployed.
 | **Hackathon** | AI Infra Summit Hackathon |
 | **Track** | SiMa On-Site |
 | **Builder** | zsz13 |
-| **Repository** | https://github.com/zsz13/sima-ai-ai-infra-summit |
+| **Repository** | https://github.com/zsz13/foreman |
 
 ---
 
